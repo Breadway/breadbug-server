@@ -66,6 +66,22 @@ Configuration is environment variables (`src/config.rs`): `BREADBUG_DATA_DIR`,
 
 ## Deploying
 
+Checklist (nothing here is done by CI):
+
+1. DNS for `bugs.breadway.dev` at Aegis and the Caddy blocks from the infra
+   repo (`feature/bugs-breadway-dev`), then `./deploy.sh` there.
+2. On Hestia: `/srv/breadbug-symbols` (written by the release pipelines,
+   mounted read-only), a `.env` with `BREADBUG_ADMIN_TOKEN_SHA256`
+   (`printf '%s' "$TOKEN" | sha256sum`), optionally the breadboard URL and a
+   token file.
+3. `docker compose -f packaging/docker-compose.yml up -d --build`. Check
+   `curl -s http://127.0.0.1:8120/healthz` on Hestia and the public hostname.
+4. Reach the admin UI only over Tailscale/LAN at `127.0.0.1:8121` on Hestia
+   (for example through an SSH tunnel); it is never routed publicly.
+5. Point `endpoint` in `breadbug.toml` (default `https://bugs.breadway.dev`)
+   at it from a test machine and send a saved test report.
+
+
 `packaging/docker-compose.yml` runs it isolated on Hestia; the public hostname
 is routed by the Aegis Caddy (see the infra repo). Nothing here is deployed
 by CI.
