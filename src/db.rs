@@ -193,6 +193,9 @@ const MIGRATIONS: &[&str] = &[
         reason       TEXT NOT NULL,
         banned_at    INTEGER NOT NULL
     );",
+    // 6: promotion bookkeeping
+    "ALTER TABLE clusters ADD COLUMN notified_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE clusters ADD COLUMN issue_priority TEXT;",
 ];
 
 impl Db {
@@ -570,6 +573,68 @@ impl Db {
     }
 
     /// Mark a cluster fixed in `version`.
+    /// Atomically claim the right to promote a cluster. False if it already
+    /// has an issue (or another promotion is running).
+    pub fn begin_promotion(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE clusters SET issue_key = 'pending'
+             WHERE id = ?1 AND issue_key IS NULL AND merged_into IS NULL",
+            params![id],
+        )? > 0)
+    }
+
+    /// Give up a claimed promotion after a failure.
+    pub fn abort_promotion(&self, id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET issue_key = NULL WHERE id = ?1 AND issue_key = 'pending'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the created issue; the count at promotion is the baseline for
+    /// "N more reports" comments.
+    pub fn finish_promotion(&self, id: i64, key: &str, priority: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET status = 'promoted', issue_key = ?2, issue_priority = ?3,
+                                 notified_count = count
+             WHERE id = ?1 AND issue_key = 'pending'",
+            params![id, key, priority],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_notified(&self, id: i64, count: u64, priority: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET notified_count = ?2, issue_priority = coalesce(?3, issue_priority)
+             WHERE id = ?1",
+            params![id, count as i64, priority],
+        )?;
+        Ok(())
+    }
+
+    /// `(cluster id, issue key)` for every cluster tracking an issue.
+    pub fn tracked_issues(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_key FROM clusters
+             WHERE issue_key IS NOT NULL AND issue_key != 'pending' AND merged_into IS NULL
+               AND status IN ('promoted', 'regressed', 'investigating', 'new')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn issue_priority(&self, id: i64) -> Result<(Option<String>, u64)> {
+        Ok(self.conn().query_row(
+            "SELECT issue_priority, notified_count FROM clusters WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+        )?)
+    }
+
     pub fn mark_fixed(&self, id: i64, version: &str) -> Result<bool> {
         Ok(self.conn().execute(
             "UPDATE clusters SET status = 'fixed', fixed_in = ?2 WHERE id = ?1 AND merged_into IS NULL",

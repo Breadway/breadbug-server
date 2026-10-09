@@ -48,6 +48,16 @@ pub struct Config {
     pub embed_model: String,
     /// Optional TOML with severity rule overrides (see `triage::ScoreRules`).
     pub triage_rules: Option<PathBuf>,
+    /// Breadboard base URL (`https://breadboard.breadway.dev`); promotion is
+    /// off without it and a token.
+    pub board_url: Option<String>,
+    /// Breadboard API token. Prefer `BREADBUG_BOARD_TOKEN_FILE`.
+    pub board_token: Option<String>,
+    /// `app=PROJECT,...` overrides for the app to project mapping.
+    pub board_projects: String,
+    /// Run lifecycle follow-ups (breadboard comments, regression checks)
+    /// before answering instead of on a background thread. For tests.
+    pub lifecycle_inline: bool,
 }
 
 impl Default for Config {
@@ -70,6 +80,10 @@ impl Default for Config {
             embed_url: None,
             embed_model: "default".to_string(),
             triage_rules: None,
+            board_url: None,
+            board_token: None,
+            board_projects: String::new(),
+            lifecycle_inline: false,
         }
     }
 }
@@ -140,6 +154,23 @@ impl Config {
             }
         }
         c.triage_rules = env_parse::<PathBuf>("BREADBUG_TRIAGE_RULES")?;
+        c.board_url = std::env::var("BREADBUG_BOARD_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        c.board_token = match env_parse::<PathBuf>("BREADBUG_BOARD_TOKEN_FILE")? {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => std::env::var("BREADBUG_BOARD_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        };
+        if let Ok(v) = std::env::var("BREADBUG_BOARD_PROJECTS") {
+            c.board_projects = v;
+        }
         if let Some(v) = env_parse::<PathBuf>("BREADBUG_SYMBOL_DIR")? {
             c.symbol_dir = Some(v);
         }

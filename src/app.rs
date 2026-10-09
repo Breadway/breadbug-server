@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::board::{parse_projects, BoardClient};
 use crate::cluster::Fuzzy;
 use crate::config::Config;
 use crate::crypto::{hmac_hex, keyed_u64, random_hex, sha256_hex};
@@ -39,6 +40,7 @@ pub struct AppState {
     embedder: Box<dyn Embedder>,
     rules: ScoreRules,
     login: Limiter,
+    board: Option<BoardClient>,
 }
 
 impl AppState {
@@ -48,6 +50,10 @@ impl AppState {
 
     pub(crate) fn login_limiter(&self) -> &Limiter {
         &self.login
+    }
+
+    pub fn board(&self) -> Option<&BoardClient> {
+        self.board.as_ref()
     }
 
     pub fn rules(&self) -> &ScoreRules {
@@ -72,10 +78,22 @@ impl AppState {
             embedder: make_embedder(&cfg),
             rules: load_rules(&cfg),
             login: Limiter::new(10, Duration::from_secs(600)),
+            board: make_board(&cfg),
             cfg,
             db: Arc::new(db),
             secret,
         })
+    }
+}
+
+fn make_board(cfg: &Config) -> Option<BoardClient> {
+    let (url, token) = (cfg.board_url.as_deref()?, cfg.board_token.as_deref()?);
+    match BoardClient::new(url, token, parse_projects(&cfg.board_projects)) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::error!(error = %e, "breadboard promotion disabled");
+            None
+        }
     }
 }
 
@@ -247,7 +265,7 @@ async fn post_report(State(s): State<Arc<AppState>>, request: Request) -> Respon
     }
 }
 
-fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Response> {
+fn store_report(s: &Arc<AppState>, body: &[u8], install_hash: &str) -> Result<Response> {
     let payload_sha = sha256_hex(body);
     if let Some(receipt) = s.db.find_duplicate(install_hash, &payload_sha)? {
         // Idempotent resend: same receipt, and no new deletion token (the
@@ -314,7 +332,7 @@ fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Respons
     })?;
     // Quarantined reports stay out of clustering until someone reviews them.
     if outcome.clean() {
-        if let Err(e) = crate::cluster::assign(
+        match crate::cluster::assign(
             &s.db,
             report_id,
             report,
@@ -324,7 +342,11 @@ fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Respons
                 threshold: s.cfg.fuzzy_threshold,
             }),
         ) {
-            tracing::error!(error = %e, "clustering failed; the report is stored unclustered");
+            Ok(Some(cluster_id)) => follow_up(s, cluster_id, report.app.version.clone()),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "clustering failed; the report is stored unclustered")
+            }
         }
     }
     Ok((
@@ -332,6 +354,24 @@ fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Respons
         Json(json!({ "receipt": receipt, "deletion_token": token, "status": "received" })),
     )
         .into_response())
+}
+
+/// Regression checks and breadboard updates never delay or fail an intake:
+/// they run on their own thread (inline only in tests).
+fn follow_up(s: &Arc<AppState>, cluster_id: i64, version: Option<String>) {
+    let st = Arc::clone(s);
+    let run = move || {
+        if let Err(e) = crate::lifecycle::after_report(&st, cluster_id, version.as_deref()) {
+            tracing::error!(error = %e, "cluster follow-up failed");
+        }
+    };
+    if s.cfg.lifecycle_inline {
+        run();
+    } else {
+        let _ = std::thread::Builder::new()
+            .name("lifecycle".into())
+            .spawn(run);
+    }
 }
 
 fn db_too_big(s: &AppState) -> bool {
@@ -402,6 +442,11 @@ pub fn maintain(s: &AppState) -> Result<usize> {
     let purged = s.db.purge_before(cutoff)?;
     if purged > 0 {
         s.db.compact()?;
+    }
+    match crate::lifecycle::sync_issue_states(s) {
+        Ok(n) if n > 0 => tracing::info!(fixed = n, "clusters marked fixed from breadboard"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "breadboard sync failed"),
     }
     Ok(purged)
 }

@@ -5,12 +5,14 @@
 
 pub mod admin;
 pub mod app;
+pub mod board;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod embed;
 pub mod fingerprint;
+pub mod lifecycle;
 pub mod ratelimit;
 pub mod rescrub;
 pub mod schema;
