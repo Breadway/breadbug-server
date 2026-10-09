@@ -14,9 +14,11 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::cluster::Fuzzy;
 use crate::config::Config;
 use crate::crypto::{hmac_hex, keyed_u64, random_hex, sha256_hex};
 use crate::db::{Db, NewReport};
+use crate::embed::{Embedder, HashEmbedder, HttpEmbedder};
 use crate::ratelimit::Limiter;
 use crate::rescrub::rescrub;
 use crate::schema::Report;
@@ -33,6 +35,7 @@ pub struct AppState {
     global: Limiter,
     in_flight: Arc<Semaphore>,
     symbols: SymbolStore,
+    embedder: Box<dyn Embedder>,
 }
 
 impl AppState {
@@ -43,11 +46,24 @@ impl AppState {
             global: Limiter::new(cfg.global_per_hour, HOUR),
             in_flight: Arc::new(Semaphore::new(cfg.max_in_flight)),
             symbols: SymbolStore::new(cfg.symbols_path()),
+            embedder: make_embedder(&cfg),
             cfg,
             db: Arc::new(db),
             secret,
         })
     }
+}
+
+fn make_embedder(cfg: &Config) -> Box<dyn Embedder> {
+    if let Some(url) = &cfg.embed_url {
+        match HttpEmbedder::new(url, &cfg.embed_model) {
+            Ok(e) => return Box::new(e),
+            Err(e) => {
+                tracing::error!(error = %e, "embedding service unusable; using the built-in embedder")
+            }
+        }
+    }
+    Box::new(HashEmbedder)
 }
 
 pub fn now_unix() -> u64 {
@@ -248,7 +264,16 @@ fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Respons
     })?;
     // Quarantined reports stay out of clustering until someone reviews them.
     if outcome.clean() {
-        if let Err(e) = crate::cluster::assign(&s.db, report_id, report, install_hash) {
+        if let Err(e) = crate::cluster::assign(
+            &s.db,
+            report_id,
+            report,
+            install_hash,
+            Some(&Fuzzy {
+                embedder: s.embedder.as_ref(),
+                threshold: s.cfg.fuzzy_threshold,
+            }),
+        ) {
             tracing::error!(error = %e, "clustering failed; the report is stored unclustered");
         }
     }

@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod embed;
 pub mod fingerprint;
 pub mod ratelimit;
 pub mod rescrub;

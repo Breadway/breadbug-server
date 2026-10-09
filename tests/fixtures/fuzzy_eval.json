@@ -1,0 +1,45 @@
+{
+  "note": "Groups of user-written descriptions. Texts in one group describe the same problem; texts in different groups do not. Variants deliberately use different wording, as real users do.",
+  "groups": [
+    {"label": "clip-paste-image-hang", "app": "clip", "texts": [
+      "clipboard hangs when I paste a large image",
+      "pasting a big image from the clipboard freezes everything for a while",
+      "clipboard manager freezes if the copied image is large, pasting never finishes"
+    ]},
+    {"label": "clip-history-empty", "app": "clip", "texts": [
+      "clipboard history is empty after restarting the session",
+      "all my copied entries are gone from the clipboard history after login",
+      "clipboard history does not persist across restarts, list is empty"
+    ]},
+    {"label": "bar-battery-wrong", "app": "clip", "texts": [
+      "battery percentage shown in the bar is wrong after resume from suspend",
+      "bar shows stale battery level after waking the laptop from suspend",
+      "after suspend the bar battery indicator keeps the old percentage"
+    ]},
+    {"label": "bar-workspace-missing", "app": "clip", "texts": [
+      "workspace indicators disappear from the bar when I plug in a second monitor",
+      "plugging in an external monitor removes the workspace buttons from the bar",
+      "bar loses its workspaces widget after connecting another display"
+    ]},
+    {"label": "search-slow-index", "app": "clip", "texts": [
+      "search takes forever to index my documents folder",
+      "indexing the documents directory is extremely slow in search",
+      "search indexer is very slow on a large documents folder"
+    ]},
+    {"label": "lock-wrong-password", "app": "clip", "texts": [
+      "lock screen rejects the correct password sometimes",
+      "my right password is refused by the lock screen every few tries",
+      "lock screen says wrong password even though it is correct"
+    ]},
+    {"label": "paper-wallpaper-black", "app": "clip", "texts": [
+      "wallpaper turns black after changing the theme colors",
+      "changing the palette makes the desktop wallpaper go black",
+      "background wallpaper becomes black when the theme palette changes"
+    ]},
+    {"label": "pad-notes-lost", "app": "clip", "texts": [
+      "notes written in the scratchpad vanish after closing it",
+      "scratchpad loses my notes as soon as I close the window",
+      "text typed into the scratchpad is gone when it is closed and reopened"
+    ]}
+  ]
+}
