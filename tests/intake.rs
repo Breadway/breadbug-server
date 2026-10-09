@@ -707,3 +707,100 @@ async fn refingerprint_moves_reports_when_rules_change_and_is_a_noop_otherwise()
     assert!(h.state.db.cluster(before).unwrap().is_none());
     assert_eq!(h.state.db.clusters().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn public_status_follows_the_cluster_and_reveals_nothing_else() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let status_of = |h: &Harness, receipt: String| {
+        let req = Request::builder()
+            .uri(format!("/v1/reports/{receipt}/status"))
+            .body(Body::empty())
+            .unwrap();
+        let h2 = h.state.clone();
+        async move {
+            let resp = public_router(h2).oneshot(req).await.unwrap();
+            let status = resp.status();
+            let b = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let body = crash("0.3", "clip::sync::run", "boom", "x");
+    let (_, _, r1) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    let rec1 = r1["receipt"].as_str().unwrap().to_string();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "received"})
+    );
+
+    // a second install reports the same problem: both are now a known issue
+    let (_, _, r2) = call(&h, post_as(&"2".repeat(32), &body)).await;
+    let rec2 = r2["receipt"].as_str().unwrap().to_string();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "duplicate"})
+    );
+    assert_eq!(status_of(&h, rec2).await.1, json!({"status": "duplicate"}));
+
+    let cid = h.state.db.cluster_of(&rec1).unwrap().unwrap();
+    h.state.db.set_status(cid, "investigating").unwrap();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "investigating"})
+    );
+    h.state.db.mark_fixed(cid, "0.4.0").unwrap();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "fixed", "fixed_in": "0.4.0"})
+    );
+    h.state.db.set_status(cid, "dismissed").unwrap();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "closed"})
+    );
+
+    // merged clusters report their target's state
+    let other = crash("0.3", "clip::other", "other", "x");
+    let (_, _, r3) = call(&h, post_as(&"3".repeat(32), &other)).await;
+    let rec3 = r3["receipt"].as_str().unwrap().to_string();
+    let c3 = h.state.db.cluster_of(&rec3).unwrap().unwrap();
+    h.state.db.set_status(cid, "fixed").unwrap();
+    h.state.db.merge_clusters(c3, cid).unwrap();
+    assert_eq!(status_of(&h, rec3).await.1["status"], json!("fixed"));
+
+    // quarantined reports look merely received; unknown receipts are 404
+    let mut leaked: Value = serde_json::from_slice(&body).unwrap();
+    leaked["notes"] = json!("mail leak@example.org");
+    let (_, _, r4) = call(
+        &h,
+        post_as(&"4".repeat(32), &serde_json::to_vec(&leaked).unwrap()),
+    )
+    .await;
+    assert_eq!(
+        status_of(&h, r4["receipt"].as_str().unwrap().to_string())
+            .await
+            .1,
+        json!({"status": "received"})
+    );
+    assert_eq!(status_of(&h, "0".repeat(32)).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn status_lookups_are_rate_limited() {
+    let h = harness(|c| c.per_network_per_hour = 3);
+    let mut last = StatusCode::OK;
+    for _ in 0..5 {
+        let req = Request::builder()
+            .uri(format!("/v1/reports/{}/status", "a".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        last = public_router(h.state.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status();
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}

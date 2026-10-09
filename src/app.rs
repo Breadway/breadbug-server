@@ -424,13 +424,29 @@ async fn delete_report(
     }
 }
 
-async fn report_status(State(s): State<Arc<AppState>>, Path(receipt): Path<String>) -> Response {
+async fn report_status(
+    State(s): State<Arc<AppState>>,
+    Path(receipt): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if !valid_receipt(&receipt) {
         return err(StatusCode::NOT_FOUND, "not found");
     }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
     let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.status_of(&receipt)).await {
-        Ok(Ok(Some(status))) => Json(json!({ "status": status })).into_response(),
+    match tokio::task::spawn_blocking(move || db.public_status(&receipt)).await {
+        Ok(Ok(Some(st))) => {
+            let mut body = json!({ "status": st.status });
+            if let Some(v) = st.fixed_in {
+                body["fixed_in"] = json!(v);
+            }
+            Json(body).into_response()
+        }
         Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
     }
