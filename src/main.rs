@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use breadbug_server::admin::admin_router;
 use breadbug_server::app::{public_router, spawn_maintenance, AppState};
 use breadbug_server::config::Config;
 use breadbug_server::crypto::load_or_create_secret;
@@ -31,6 +32,21 @@ async fn server_main() -> Result<()> {
     let db = Db::open(&cfg.data_dir.join("breadbug.db"))?;
     let state = AppState::new(cfg.clone(), db, secret);
     spawn_maintenance(Arc::clone(&state));
+
+    if cfg.admin_token_sha256.is_some() {
+        let admin = tokio::net::TcpListener::bind(cfg.admin_addr)
+            .await
+            .with_context(|| format!("bind {}", cfg.admin_addr))?;
+        tracing::info!(addr = %cfg.admin_addr, "admin listening");
+        let router = admin_router(Arc::clone(&state));
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin, router).await {
+                tracing::error!(error = %e, "admin listener stopped");
+            }
+        });
+    } else {
+        tracing::info!("admin disabled (BREADBUG_ADMIN_TOKEN_SHA256 not set)");
+    }
 
     let public = tokio::net::TcpListener::bind(cfg.public_addr)
         .await

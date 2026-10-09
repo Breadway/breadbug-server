@@ -3,10 +3,7 @@
 //! Everything arriving on the public listener is hostile input. See
 //! `docs/threat-model.md`.
 
-pub fn symbol_worker_entry() -> bool {
-    symbolicate::worker_main()
-}
-
+pub mod admin;
 pub mod app;
 pub mod cluster;
 pub mod config;
@@ -18,3 +15,8 @@ pub mod ratelimit;
 pub mod rescrub;
 pub mod schema;
 pub mod symbolicate;
+pub mod triage;
+
+pub fn symbol_worker_entry() -> bool {
+    symbolicate::worker_main()
+}
