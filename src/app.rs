@@ -146,6 +146,7 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         .route("/v1/reports/{receipt}/status", get(report_status))
         .route("/v1/reports/{receipt}/follow", post(follow_report))
         .route("/v1/follows/{token}", delete(unfollow))
+        .route("/v1/follows/{token}/notifications", get(follow_notices))
         .layer(DefaultBodyLimit::max(state.cfg.max_body_bytes))
         .with_state(state)
 }
@@ -632,6 +633,47 @@ async fn unfollow(
     match tokio::task::spawn_blocking(move || db.unfollow(&token_hash)).await {
         Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Ok(false)) => err(StatusCode::NOT_FOUND, "not found"),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    }
+}
+
+/// Read a follow's pending notifications. Drain on read: notices are
+/// returned once and marked delivered, so a retry never delivers a
+/// duplicate. Unknown tokens are 404, like unfollow. Clients should check
+/// the report status first and only fetch here when progress or releases
+/// changed, rather than polling on a timer.
+async fn follow_notices(
+    State(s): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        if !db.has_follow(&token_hash)? {
+            return anyhow::Ok(None);
+        }
+        Ok(Some(db.take_notices(&token_hash)?))
+    })
+    .await
+    {
+        Ok(Ok(Some(notices))) => {
+            let list: Vec<Value> = notices
+                .into_iter()
+                .map(|n| json!({ "event": n.event, "text": n.text, "at": n.created_at }))
+                .collect();
+            Json(json!({ "notices": list })).into_response()
+        }
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
     }
 }

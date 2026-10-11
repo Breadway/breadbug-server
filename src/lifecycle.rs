@@ -359,6 +359,49 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
 /// cluster whose issue the board has reopened is returned to the promoted
 /// state. The issue's workflow status is cached on every pass so the public
 /// progress stage stays current. Returns how many changed.
+/// User-facing notice text for a cluster transition. Names the application
+/// and version, and says which stage was reached: fixed in development, out
+/// in beta, or available in stable.
+pub fn notice_text(c: &ClusterRow, event: &str, version: Option<&str>) -> String {
+    let thing = match c.kind.as_str() {
+        "request" => "A feature you follow",
+        _ => "A bug you follow",
+    };
+    let done = match c.kind.as_str() {
+        "request" => "has been implemented",
+        _ => "has been fixed",
+    };
+    let v = version
+        .map(|v| format!(" {} {}", c.app, v))
+        .unwrap_or_default();
+    match event {
+        "beta" => format!("{thing} is available in the{v} beta."),
+        "stable" => format!("{thing} is available in{v} stable."),
+        _ if v.is_empty() => format!("{thing} {done}. Thanks for helping us improve it!"),
+        _ => format!("{thing} {done} in{v}. Thanks for helping us improve it!"),
+    }
+}
+
+/// Queue notices for every follow of a cluster. Failures are returned for
+/// logging and never affect the admin action or intake.
+pub fn notify(
+    c: &ClusterRow,
+    db: &crate::db::Db,
+    event: &str,
+    version: Option<&str>,
+) -> Result<usize> {
+    db.notify_follows(
+        c.id,
+        event,
+        &notice_text(c, event, version),
+        crate::app::now_unix(),
+    )
+}
+
+/// Hourly: clusters whose board issue reached `done` are marked fixed, and a
+/// cluster whose issue the board has reopened is returned to the promoted
+/// state. The issue's workflow status is cached on every pass so the public
+/// progress stage stays current. Returns how many changed.
 pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     let Some(board) = s.board() else {
         return Ok(0);
@@ -370,6 +413,7 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
         };
         let _ = s.db.set_issue_status(id, &state.status);
         let Some(c) = s.db.cluster(id)? else { continue };
+<<<<<<< HEAD
         let live = matches!(
             c.status.as_str(),
             "promoted" | "regressed" | "investigating" | "new"

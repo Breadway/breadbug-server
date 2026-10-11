@@ -101,6 +101,15 @@ pub struct ChannelRelease {
     pub shipped_in: Option<String>,
 }
 
+/// A pending notification for one follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub id: i64,
+    pub event: String,
+    pub text: String,
+    pub created_at: u64,
+}
+
 /// Planned vs confirmed availability for both channels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseTrack {
@@ -344,6 +353,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE clusters ADD COLUMN confirmed_beta TEXT;
     ALTER TABLE clusters ADD COLUMN target_stable TEXT;
     ALTER TABLE clusters ADD COLUMN confirmed_stable TEXT;",
+    // 10: notification outbox: one row per follow per transition version.
+    // Repeating a transition never duplicates (the first text wins); a new
+    // version is new information and notifies again. Delivered rows stay so
+    // the dedup survives reads.
+    "CREATE TABLE notices (
+        id           INTEGER PRIMARY KEY,
+        cluster_id   INTEGER NOT NULL,
+        token_hash   TEXT NOT NULL,
+        event        TEXT NOT NULL,
+        text         TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        delivered    INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(token_hash, event, text)
+    );
+    CREATE INDEX notices_token ON notices(token_hash);",
 ];
 
 impl Db {
@@ -547,6 +571,14 @@ impl Db {
         )?;
         conn.execute(
             "DELETE FROM follows WHERE cluster_id NOT IN (SELECT id FROM clusters)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM notices WHERE cluster_id NOT IN (SELECT id FROM clusters)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM notices WHERE token_hash NOT IN (SELECT token_hash FROM follows)",
             [],
         )?;
         Ok(n)
@@ -1098,6 +1130,17 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             "UPDATE follows SET cluster_id = ?2 WHERE cluster_id = ?1",
             params![from, into],
         )?;
+        // Pending notices move with their follows. A follow that already has
+        // the same event on the target keeps the target's copy.
+        tx.execute(
+            "DELETE FROM notices WHERE cluster_id = ?1 AND (token_hash, event) IN
+             (SELECT token_hash, event FROM notices WHERE cluster_id = ?2)",
+            params![from, into],
+        )?;
+        tx.execute(
+            "UPDATE notices SET cluster_id = ?2 WHERE cluster_id = ?1",
+            params![from, into],
+        )?;
         tx.execute(
             "UPDATE clusters SET merged_into = ?2, count = 0 WHERE id = ?1",
             params![from, into],
@@ -1478,10 +1521,19 @@ c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
 
     /// Stop following. Returns false for an unknown token.
     pub fn unfollow(&self, token_hash: &str) -> Result<bool> {
-        Ok(self.conn().execute(
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
             "DELETE FROM follows WHERE token_hash = ?1",
             params![token_hash],
-        )? > 0)
+        )?;
+        // Pending notices for a dead follow go away with it.
+        tx.execute(
+            "UPDATE notices SET delivered = 1 WHERE token_hash = ?1 AND delivered = 0",
+            params![token_hash],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     /// How many installs follow a cluster (a merge can leave an install with
@@ -1506,6 +1558,83 @@ c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
             )
             .optional()?;
         Ok(stored.is_some_and(|s| ct_eq(&s, token_hash)))
+
+    /// A pending notification for one follow.
+    /// Whether a follow token is live.
+    pub fn has_follow(&self, token_hash: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM follows WHERE token_hash = ?1",
+                params![token_hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Peek at a follow's undelivered notifications without consuming them.
+    pub fn notices_for(&self, token_hash: &str) -> Result<Vec<Notice>> {
+        Ok(self
+            .conn()
+            .prepare(
+                "SELECT id, event, text, created_at FROM notices
+                 WHERE token_hash = ?1 AND delivered = 0 ORDER BY id",
+            )?
+            .query_map(params![token_hash], |r| {
+                Ok(Notice {
+                    id: r.get(0)?,
+                    event: r.get(1)?,
+                    text: r.get(2)?,
+                    created_at: r.get::<_, i64>(3)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Read pending notifications and mark them delivered. A retry after a
+    /// successful read finds nothing, so nothing is ever sent twice, and the
+    /// delivered rows keep deduplicating future repeats of a transition.
+    pub fn take_notices(&self, token_hash: &str) -> Result<Vec<Notice>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let out = tx
+            .prepare(
+                "SELECT id, event, text, created_at FROM notices
+                 WHERE token_hash = ?1 AND delivered = 0 ORDER BY id",
+            )?
+            .query_map(params![token_hash], |r| {
+                Ok(Notice {
+                    id: r.get(0)?,
+                    event: r.get(1)?,
+                    text: r.get(2)?,
+                    created_at: r.get::<_, i64>(3)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        tx.execute(
+            "UPDATE notices SET delivered = 1 WHERE token_hash = ?1 AND delivered = 0",
+            params![token_hash],
+        )?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Queue one notice per follow of a cluster. Retries are safe: a follow
+    /// keeps its first notice per event text, so re-running a transition never
+    /// duplicates. Returns how many follows were notified.
+    pub fn notify_follows(
+        &self,
+        cluster_id: i64,
+        event: &str,
+        text: &str,
+        at: u64,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "INSERT OR IGNORE INTO notices (cluster_id, token_hash, event, text, created_at)
+                 SELECT ?1, token_hash, ?2, ?3, ?4 FROM follows WHERE cluster_id = ?1",
+            params![cluster_id, event, text, at as i64],
+        )?)
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really

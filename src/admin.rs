@@ -629,7 +629,17 @@ async fn mark_fixed(
         );
     }
     let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.mark_fixed(id, &version)).await {
+    match tokio::task::spawn_blocking(move || {
+        if !db.mark_fixed(id, &version)? {
+            return anyhow::Ok(false);
+        }
+        if let Some(c) = db.cluster(id)? {
+            let _ = crate::lifecycle::notify(&c, &db, "fixed", Some(&version));
+        }
+        anyhow::Ok(true)
+    })
+    .await
+    {
         Ok(Ok(true)) => back_to(id),
         Ok(Ok(false)) => notice(StatusCode::BAD_REQUEST, "Unknown cluster."),
         _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not update."),
@@ -717,8 +727,16 @@ async fn mark_release_confirmed(
         );
     };
     let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.mark_release_confirmed(id, &channel, &version))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        if !db.mark_release_confirmed(id, &channel, &version)? {
+            return anyhow::Ok(false);
+        }
+        if let Some(c) = db.cluster(id)? {
+            let _ = crate::lifecycle::notify(&c, &db, &channel, Some(&version));
+        }
+        anyhow::Ok(true)
+    })
+    .await
     {
         Ok(Ok(true)) => back_to(id),
         Ok(Ok(false)) => notice(
