@@ -43,34 +43,50 @@ pub struct PublicStatus {
     /// |---|---|
     /// | cluster `dismissed` | `declined` |
     /// | cluster `deferred` | `deferred` |
-    /// | cluster `fixed` | `completed` |
+    /// | issue `done` | `completed` |
+    /// | issue `review` | `fixed` |
+    /// | cluster `fixed` with a recorded version | `targeting_release` |
+    /// | cluster `fixed` without a version | `fixed` |
     /// | issue `backlog` or `todo` | `accepted` |
     /// | issue `doing` | `in_development` |
-    /// | issue `review` | `in_review` |
-    /// | issue `done` | `completed` |
-    ///
-    /// Release targeting (`target_beta`, `confirmed_stable`, ...) is tracked
-    /// separately, not in this field.
     pub progress: Option<String>,
 }
 
 /// Development progress for a cluster row. See [`PublicStatus::progress`]
-/// for the mapping table.
+/// for the mapping table. Cluster verdicts take precedence, then a completed
+/// board issue, then the cluster's own fixed state, then the remaining board
+/// stages.
 pub fn progress_of(c: &ClusterRow) -> Option<&'static str> {
     match c.status.as_str() {
         "dismissed" => return Some("declined"),
         "deferred" => return Some("deferred"),
-        "fixed" => return Some("completed"),
         _ => {}
     }
-    c.issue_key.as_deref().filter(|k| *k != "pending")?;
-    match c.issue_status.as_deref() {
-        Some("backlog") | Some("todo") => Some("accepted"),
-        Some("doing") => Some("in_development"),
-        Some("review") => Some("in_review"),
-        Some("done") => Some("completed"),
-        _ => None,
+    let linked = c.issue_key.as_deref().filter(|k| *k != "pending");
+    if linked.is_some() {
+        match c.issue_status.as_deref() {
+            Some("done") => return Some("completed"),
+            Some("review") => return Some("fixed"),
+            _ => {}
+        }
     }
+    if c.status == "fixed" {
+        // A recorded fix version names the release the fix targets; with no
+        // version the fix is implemented but not yet aimed at a release.
+        return Some(if c.fixed_in.is_some() {
+            "targeting_release"
+        } else {
+            "fixed"
+        });
+    }
+    if linked.is_some() {
+        match c.issue_status.as_deref() {
+            Some("backlog") | Some("todo") => return Some("accepted"),
+            Some("doing") => return Some("in_development"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A report shown as evidence in the triage view.
@@ -747,7 +763,10 @@ impl Db {
         Ok(())
     }
 
-    /// `(cluster id, issue key)` for every cluster tracking an issue.
+    /// `(cluster id, issue key)` for every cluster tracking an issue. This
+    /// includes fixed, dismissed and deferred groups: their board issue can
+    /// still move, and a fixed cluster whose issue reopens must be re-derived
+    /// rather than frozen.
     pub fn tracked_issues(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(

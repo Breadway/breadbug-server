@@ -108,7 +108,7 @@ fn progress_mapping_covers_every_stage() {
         ("backlog", "accepted"),
         ("todo", "accepted"),
         ("doing", "in_development"),
-        ("review", "in_review"),
+        ("review", "fixed"),
         ("done", "completed"),
     ] {
         c.status = "promoted".into();
@@ -126,7 +126,14 @@ fn progress_mapping_covers_every_stage() {
     assert_eq!(progress_of(&c), Some("declined"));
     c.status = "deferred".into();
     assert_eq!(progress_of(&c), Some("deferred"));
+    // A fixed cluster is implemented, and aims at a release once a version is
+    // recorded. A done issue still reads completed.
     c.status = "fixed".into();
+    c.fixed_in = None;
+    assert_eq!(progress_of(&c), Some("fixed"));
+    c.fixed_in = Some("0.4.0".into());
+    assert_eq!(progress_of(&c), Some("targeting_release"));
+    c.issue_status = Some("done".into());
     assert_eq!(progress_of(&c), Some("completed"));
 }
 

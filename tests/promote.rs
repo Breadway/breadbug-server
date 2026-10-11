@@ -363,7 +363,7 @@ async fn public_progress_follows_the_board_issue_through_every_stage() {
     for (board, stage) in [
         ("todo", "accepted"),
         ("doing", "in_development"),
-        ("review", "in_review"),
+        ("review", "fixed"),
     ] {
         *m.issue_status.lock().unwrap() = board.into();
         sync(&st).await;
@@ -373,12 +373,20 @@ async fn public_progress_follows_the_board_issue_through_every_stage() {
             "{board}"
         );
     }
+    // A recorded fix version aims the fix at a release.
+    assert!(st.db.mark_fixed(id, "0.4.0").unwrap());
+    *m.issue_status.lock().unwrap() = "doing".into();
+    sync(&st).await;
+    assert_eq!(
+        status_of(&st, &r).await["progress"],
+        json!("targeting_release")
+    );
     // Board done: the cluster is fixed and progress is completed.
     *m.issue_status.lock().unwrap() = "done".into();
     sync(&st).await;
     assert_eq!(
         status_of(&st, &r).await,
-        json!({"status": "fixed", "progress": "completed"})
+        json!({"status": "fixed", "fixed_in": "0.4.0", "progress": "completed"})
     );
 
     // A dismissed cluster reads declined; a deferred one reads deferred.
@@ -659,14 +667,6 @@ async fn the_board_token_never_appears_in_stored_data() {
     drop(d);
 }
 
-async fn sync(st: &Arc<AppState>) {
-    let st2 = st.clone();
-    tokio::task::spawn_blocking(move || sync_issue_states(&st2))
-        .await
-        .unwrap()
-        .unwrap();
-}
-
 #[tokio::test]
 async fn done_with_a_fix_version_is_persisted_and_gates_regression() {
     let m = mock_board();
@@ -752,4 +752,86 @@ async fn an_admin_fixed_cluster_is_not_reopened_by_the_board() {
     let c = st.db.cluster(id).unwrap().unwrap();
     assert_eq!(c.status, "fixed");
     assert!(!c.board_fixed);
+
+#[tokio::test]
+async fn board_reopen_follows_for_manual_and_request_clusters() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r1 = post(
+        &st,
+        1,
+        &manual(
+            "Panel flickers on workspace switch",
+            "The top panel flickers on every workspace switch.",
+        ),
+    )
+    .await;
+    let r2 = post(
+        &st,
+        2,
+        &request(
+            "Dark mode for the panel",
+            "A dark theme option for the top panel.",
+            "Night shifts here, the bright panel is painful.",
+        ),
+    )
+    .await;
+    let (c1, c2) = (cluster_id(&st, &r1), cluster_id(&st, &r2));
+    assert_eq!(promote_blocking(&st, c1).await, "CLIP-9");
+    assert_eq!(promote_blocking(&st, c2).await, "CLIP-10");
+
+    // The board marks both done: fixed, and they stay tracked.
+    *m.issue_status.lock().unwrap() = "done".into();
+    sync(&st).await;
+    assert_eq!(st.db.cluster(c1).unwrap().unwrap().status, "fixed");
+    assert_eq!(st.db.cluster(c2).unwrap().unwrap().status, "fixed");
+
+    // The board reopens them: the public state follows back to investigating.
+    *m.issue_status.lock().unwrap() = "doing".into();
+    sync(&st).await;
+    assert_eq!(st.db.cluster(c1).unwrap().unwrap().status, "promoted");
+    assert_eq!(st.db.cluster(c2).unwrap().unwrap().status, "promoted");
+
+    // Done again re-fixes.
+    *m.issue_status.lock().unwrap() = "done".into();
+    sync(&st).await;
+    assert_eq!(st.db.cluster(c1).unwrap().unwrap().status, "fixed");
+}
+
+#[tokio::test]
+async fn manual_and_request_promotion_retry_and_double_promote() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r = post(
+        &st,
+        1,
+        &manual(
+            "Panel flickers on workspace switch",
+            "The top panel flickers on every workspace switch.",
+        ),
+    )
+    .await;
+    let id = cluster_id(&st, &r);
+
+    // A failed create releases the claim so a retry can succeed.
+    *m.fail_create.lock().unwrap() = true;
+    let st2 = st.clone();
+    assert!(tokio::task::spawn_blocking(move || promote(&st2, id))
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().issue_key, None);
+    *m.fail_create.lock().unwrap() = false;
+    assert_eq!(promote_blocking(&st, id).await, "CLIP-9");
+    // A second promotion is refused, and only one issue was created.
+    let st2 = st.clone();
+    assert!(tokio::task::spawn_blocking(move || promote(&st2, id))
+        .await
+        .unwrap()
+        .is_err());
+    let creates = by_path(&m, "POST", "/api/issues")
+        .into_iter()
+        .filter(|r| r.path == "/api/issues")
+        .count();
+    assert_eq!(creates, 2, "one failed attempt plus one success");
 }
