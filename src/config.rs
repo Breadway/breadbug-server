@@ -34,6 +34,9 @@ pub struct Config {
     pub trust_proxy: bool,
     /// Largest data directory the server will grow to, in bytes.
     pub max_db_bytes: u64,
+    /// Debug symbols keyed by build-id (`<xx>/<build-id>.debug`), published
+    /// by the release pipeline. Defaults to `<data_dir>/symbols`.
+    pub symbol_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -51,6 +54,7 @@ impl Default for Config {
             max_in_flight: 16,
             trust_proxy: false,
             max_db_bytes: 2 * 1024 * 1024 * 1024,
+            symbol_dir: None,
         }
     }
 }
@@ -109,6 +113,16 @@ impl Config {
         if let Some(v) = env_parse("BREADBUG_MAX_DB_BYTES")? {
             c.max_db_bytes = v;
         }
+        if let Some(v) = env_parse::<PathBuf>("BREADBUG_SYMBOL_DIR")? {
+            c.symbol_dir = Some(v);
+        }
         Ok(c)
+    }
+
+    /// Where debug symbols are looked up.
+    pub fn symbols_path(&self) -> PathBuf {
+        self.symbol_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("symbols"))
     }
 }

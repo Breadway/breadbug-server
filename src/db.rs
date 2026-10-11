@@ -26,6 +26,9 @@ pub struct NewReport<'a> {
 /// `(id, token_hash, install_hash, cluster_id, app_version, raw)`.
 type DeleteRow = (i64, String, String, Option<i64>, Option<String>, String);
 
+/// `(build_id, app, app_version, count)` of symbols we were asked for but lack.
+pub type MissingSymbols = (String, String, Option<String>, u64);
+
 /// A stored report, for maintenance jobs.
 pub struct StoredReport {
     pub id: i64,
@@ -137,6 +140,15 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (cluster_id, install_hash)
     );
     CREATE INDEX reports_cluster ON reports(cluster_id);",
+    // 3: build-ids we were asked to symbolicate but have no symbols for
+    "CREATE TABLE missing_symbols (
+        build_id    TEXT PRIMARY KEY,
+        app         TEXT NOT NULL,
+        app_version TEXT,
+        first_seen  INTEGER NOT NULL,
+        last_seen   INTEGER NOT NULL,
+        count       INTEGER NOT NULL DEFAULT 1
+    );",
 ];
 
 impl Db {
@@ -408,6 +420,40 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Remember build-ids that could not be symbolicated for lack of symbols.
+    pub fn note_missing_symbols(
+        &self,
+        build_ids: &[String],
+        app: &str,
+        version: Option<&str>,
+        at: u64,
+    ) -> Result<()> {
+        let conn = self.conn();
+        for id in build_ids {
+            conn.execute(
+                "INSERT INTO missing_symbols (build_id, app, app_version, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(build_id) DO UPDATE SET last_seen = ?4, count = count + 1",
+                params![id, app, version, at as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `(build_id, app, app_version, count)`, most requested first.
+    pub fn missing_symbols(&self) -> Result<Vec<MissingSymbols>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT build_id, app, app_version, count FROM missing_symbols ORDER BY count DESC, build_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Test hook: overwrite a cluster's fingerprint to simulate older rules.

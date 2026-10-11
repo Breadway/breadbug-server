@@ -14,11 +14,13 @@ name = "breadbug-server"
 path = "src/main.rs"
 
 [dependencies]
+addr2line = "0.25"
 anyhow = "1"
 axum = "0.8"
 bread-scrub = { git = "https://git.breadway.dev/Breadway/bread", branch = "feature/breadbug-scrubber" }
 hex = "0.4"
 hmac = "0.12"
+object = { version = "0.37", default-features = false, features = ["read", "std"] }
 rand = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+ctor = "0.8"
 http-body = "1"
 http-body-util = "0.1"
 tempfile = "3"

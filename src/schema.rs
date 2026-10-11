@@ -119,6 +119,11 @@ pub struct Frame {
     pub build_id: Option<String>,
     #[serde(default)]
     pub symbol: Option<String>,
+    /// Source file and line, filled in by the server's symbolication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +252,7 @@ fn frames(fs: &[Frame], what: &str) -> Result<(), String> {
         opt(&f.module, 1024, "frame module")?;
         opt(&f.build_id, 128, "frame build id")?;
         opt(&f.symbol, 1024, "frame symbol")?;
+        opt(&f.file, 1024, "frame file")?;
     }
     Ok(())
 }

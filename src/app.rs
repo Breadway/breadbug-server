@@ -20,6 +20,7 @@ use crate::db::{Db, NewReport};
 use crate::ratelimit::Limiter;
 use crate::rescrub::rescrub;
 use crate::schema::Report;
+use crate::symbolicate::SymbolStore;
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -31,6 +32,7 @@ pub struct AppState {
     per_network: Limiter,
     global: Limiter,
     in_flight: Arc<Semaphore>,
+    symbols: SymbolStore,
 }
 
 impl AppState {
@@ -40,6 +42,7 @@ impl AppState {
             per_network: Limiter::new(cfg.per_network_per_hour, HOUR),
             global: Limiter::new(cfg.global_per_hour, HOUR),
             in_flight: Arc::new(Semaphore::new(cfg.max_in_flight)),
+            symbols: SymbolStore::new(cfg.symbols_path()),
             cfg,
             db: Arc::new(db),
             secret,
@@ -155,15 +158,13 @@ async fn post_report(State(s): State<Arc<AppState>>, request: Request) -> Respon
     if body.is_empty() {
         return err(StatusCode::BAD_REQUEST, "empty body");
     }
-    let report = match Report::parse(&body, now_unix()) {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
-    };
+    if let Err(e) = Report::parse(&body, now_unix()) {
+        return err(StatusCode::BAD_REQUEST, &e);
+    }
 
     let state = s.clone();
     let result =
-        tokio::task::spawn_blocking(move || store_report(&state, &report, &body, &install_hash))
-            .await;
+        tokio::task::spawn_blocking(move || store_report(&state, &body, &install_hash)).await;
     match result {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
@@ -180,12 +181,7 @@ async fn post_report(State(s): State<Arc<AppState>>, request: Request) -> Respon
     }
 }
 
-fn store_report(
-    s: &AppState,
-    report: &Report,
-    body: &[u8],
-    install_hash: &str,
-) -> Result<Response> {
+fn store_report(s: &AppState, body: &[u8], install_hash: &str) -> Result<Response> {
     let payload_sha = sha256_hex(body);
     if let Some(receipt) = s.db.find_duplicate(install_hash, &payload_sha)? {
         // Idempotent resend: same receipt, and no new deletion token (the
@@ -212,7 +208,28 @@ fn store_report(
     let value: Value = serde_json::from_slice(body)?;
     let outcome = rescrub(&value);
     let hits = serde_json::to_string(&outcome.hits)?;
-    let raw = serde_json::to_string(&outcome.value)?;
+    let mut raw = serde_json::to_string(&outcome.value)?;
+
+    // From here on, work with the scrubbed form only. Symbolication fills in
+    // function names from the release symbol store; the stored copy carries
+    // them so the triage view and re-fingerprinting see them.
+    let mut report: Report = serde_json::from_value(outcome.value.clone())?;
+    let stats = s.symbols.symbolicate(&mut report);
+    if stats.resolved > 0 {
+        raw = serde_json::to_string(&report)?;
+    }
+    if !stats.missing_build_ids.is_empty() {
+        let ids: Vec<String> = stats.missing_build_ids.into_iter().collect();
+        if let Err(e) = s.db.note_missing_symbols(
+            &ids,
+            &report.app.id,
+            report.app.version.as_deref(),
+            now_unix(),
+        ) {
+            tracing::error!(error = %e, "recording missing symbols failed");
+        }
+    }
+    let report = &report;
 
     let receipt = random_hex(16);
     let token = random_hex(32);

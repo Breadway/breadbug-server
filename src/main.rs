@@ -7,8 +7,17 @@ use breadbug_server::crypto::load_or_create_secret;
 use breadbug_server::db::Db;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if breadbug_server::symbolicate::worker_main() {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(server_main())
+}
+
+async fn server_main() -> Result<()> {
     // No request logging: addresses and payloads never reach the logs.
     tracing_subscriber::fmt()
         .with_env_filter(
