@@ -134,4 +134,39 @@ fn title_is_only_for_manual_reports() {
     let mut v = minimal();
     v["title"] = json!("sneaky");
     assert!(parse(&v).is_err());
+    let mut v = minimal();
+    v["want"] = json!("sneaky");
+    assert!(parse(&v).is_err());
+    let mut v = manual();
+    v["want"] = json!("sneaky");
+    assert!(parse(&v).is_err());
+}
+
+fn request() -> Value {
+    json!({
+        "schema": 1,
+        "report_type": "request",
+        "created_unix": 1000,
+        "app": { "id": "clip", "version": "0.3.1" },
+        "title": "Dark mode for the panel",
+        "want": "A dark theme option for the top panel.",
+        "notes": "I work at night and the bright panel hurts my eyes."
+    })
+}
+
+#[test]
+fn feature_request_needs_title_want_and_why() {
+    assert!(parse(&request()).is_ok());
+    for (path, val) in [
+        ("title", json!(null)),
+        ("title", json!("  ")),
+        ("want", json!(null)),
+        ("want", json!(" ")),
+        ("notes", json!(null)),
+        ("notes", json!("")),
+    ] {
+        let mut v = request();
+        v[path] = val;
+        assert!(parse(&v).is_err(), "{path}");
+    }
 }

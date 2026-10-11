@@ -1,7 +1,8 @@
 //! Explainable severity scoring for clusters.
 //!
-//! Severity is rules, not a model: crash beats freeze beats behavior and manual,
-//! then volume, spread across installs and versions, and recency adjust it. Every
+//! Severity is rules, not a model: crash beats freeze beats behavior, manual
+//! reports and feature requests, then volume, spread across installs and
+//! versions, and recency adjust it. Every
 //! volume, spread across installs and versions, and recency adjust it. Every
 //! point is attributed to a rule so the inbox can show why a cluster ranks
 //! where it does. Rules can be tuned with a TOML file (`BREADBUG_TRIAGE_RULES`).

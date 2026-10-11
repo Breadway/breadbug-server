@@ -29,7 +29,12 @@ const MIN_TOKENS: usize = 3;
 fn meaningful(text: &str) -> usize {
     tokens(text)
         .into_iter()
-        .filter(|t| !matches!(t.as_str(), "crash" | "freeze" | "behavior" | "manual"))
+        .filter(|t| {
+            !matches!(
+                t.as_str(),
+                "crash" | "freeze" | "behavior" | "manual" | "request"
+            )
+        })
         .collect::<std::collections::BTreeSet<_>>()
         .len()
 }

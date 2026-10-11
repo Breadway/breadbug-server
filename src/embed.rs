@@ -215,6 +215,11 @@ pub fn report_text(r: &Report) -> String {
         parts.push(t.clone());
         parts.push(t.clone());
     }
+    if let Some(w) = &r.want {
+        // A request's want names the feature: same weight as the title.
+        parts.push(w.clone());
+        parts.push(w.clone());
+    }
     if let Some(n) = &r.notes {
         // The user's own words are the strongest signal: count them twice.
         parts.push(n.clone());

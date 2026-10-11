@@ -979,5 +979,67 @@ async fn manual_reports_are_covered_by_retention() {
     call(&h, post_as(&"1".repeat(32), &body)).await;
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(maintain(&h.state).unwrap(), 1);
+// ---- feature requests -----------------------------------------------------
+
+fn feature_request(title: &str, want: &str, why: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema": 1,
+        "report_type": "request",
+        "created_unix": 1000,
+        "app": {"id": "clip", "version": "0.3.1"},
+        "title": title,
+        "want": want,
+        "notes": why,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn feature_requests_are_accepted_and_grouped_by_text() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let title = "Dark mode for the panel";
+    let a = feature_request(
+        title,
+        "A dark theme option for the top panel.",
+        "I work at night and the bright panel hurts.",
+    );
+    let b = feature_request(
+        title,
+        "Let the top panel use a dark theme.",
+        "Night shifts here, the bright panel is painful.",
+    );
+    let (s1, _, r1) = call(&h, post_as(&"1".repeat(32), &a)).await;
+    let (s2, _, r2) = call(&h, post_as(&"2".repeat(32), &b)).await;
+    assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED));
+    let c1 = h
+        .state
+        .db
+        .cluster_of(r1["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let c2 = h
+        .state
+        .db
+        .cluster_of(r2["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(c1, c2);
+    let cluster = h.state.db.cluster(c1).unwrap().unwrap();
+    assert_eq!(cluster.kind, "request");
+    assert_eq!(cluster.title, title);
+    assert_eq!((cluster.count, cluster.installs), (2, 2));
+}
+
+#[tokio::test]
+async fn feature_requests_need_what_and_why() {
+    let h = harness(|_| {});
+    for body in [
+        feature_request("", "some want", "some why"),
+        feature_request("A title", "", "some why"),
+        feature_request("A title", "some want", "  "),
+    ] {
+        let (status, _, _) = call(&h, post_as(&"1".repeat(32), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     assert_eq!(h.state.db.report_count().unwrap(), 0);
 }

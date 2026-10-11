@@ -32,6 +32,7 @@ pub enum ReportType {
     Freeze,
     Behavior,
     Manual,
+    Request,
 }
 
 impl ReportType {
@@ -41,6 +42,7 @@ impl ReportType {
             Self::Freeze => "freeze",
             Self::Behavior => "behavior",
             Self::Manual => "manual",
+            Self::Request => "request",
         }
     }
 }
@@ -192,10 +194,14 @@ pub struct Report {
     pub journal: Vec<String>,
     #[serde(default)]
     pub live_stack: Vec<Frame>,
-    /// Short user-written title. Only manual reports may set this; automatic
-    /// reports keep their derived titles so clients cannot spoof clustering.
+    /// Short user-written title. Only manual reports and feature requests may
+    /// set this; automatic reports keep their derived titles so clients
+    /// cannot spoof clustering.
     #[serde(default)]
     pub title: Option<String>,
+    /// What the requester wants. Only feature requests may set this.
+    #[serde(default)]
+    pub want: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
     /// Optional reference (a path or opaque id, never the bytes) to a
@@ -383,8 +389,24 @@ impl Report {
                 Some(n) if !n.trim().is_empty() => {}
                 _ => return Err("manual reports need a description in notes".into()),
             }
-        } else if self.title.is_some() {
-            return Err("title is only for manual reports".into());
+            if self.want.is_some() {
+                return Err("want is only for feature requests".into());
+            }
+        } else if self.report_type == ReportType::Request {
+            match &self.title {
+                Some(t) if !t.trim().is_empty() && t.len() <= MAX_TITLE => {}
+                _ => return Err("feature requests need a short title".into()),
+            }
+            match &self.want {
+                Some(w) if !w.trim().is_empty() && w.len() <= MAX_STR => {}
+                _ => return Err("feature requests need what is wanted in want".into()),
+            }
+            match &self.notes {
+                Some(n) if !n.trim().is_empty() => {}
+                _ => return Err("feature requests need why it matters in notes".into()),
+            }
+        } else if self.title.is_some() || self.want.is_some() {
+            return Err("title and want are only for manual reports and requests".into());
         }
         list(
             &self.redactions.keys().collect::<Vec<_>>(),
