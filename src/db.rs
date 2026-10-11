@@ -1558,8 +1558,8 @@ c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
             )
             .optional()?;
         Ok(stored.is_some_and(|s| ct_eq(&s, token_hash)))
+    }
 
-    /// A pending notification for one follow.
     /// Whether a follow token is live.
     pub fn has_follow(&self, token_hash: &str) -> Result<bool> {
         Ok(self
@@ -1635,6 +1635,124 @@ c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
                  SELECT ?1, token_hash, ?2, ?3, ?4 FROM follows WHERE cluster_id = ?1",
             params![cluster_id, event, text, at as i64],
         )?)
+    }
+
+    /// Acknowledge specific pending notices (durable ack). Only the ids given
+    /// are marked delivered, so a client that read but crashed before acking
+    /// sees them again on the next read.
+    pub fn ack_notices(&self, token_hash: &str, ids: &[i64]) -> Result<usize> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        for id in ids {
+            n += tx.execute(
+                "UPDATE notices SET delivered = 1
+                 WHERE token_hash = ?1 AND id = ?2 AND delivered = 0",
+                params![token_hash, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Mark a cluster fixed (recording a version when given) and queue its
+    /// notices in one transaction, so a crash between the two cannot leave a
+    /// fixed cluster with no notice queued. Returns whether it was updated.
+    pub fn mark_fixed_and_notify(
+        &self,
+        id: i64,
+        version: Option<&str>,
+        event: &str,
+        text: &str,
+        at: u64,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE clusters SET status = 'fixed', fixed_in = coalesce(?2, fixed_in)
+             WHERE id = ?1 AND merged_into IS NULL",
+            params![id, version],
+        )? > 0;
+        tx.execute(
+            "INSERT OR IGNORE INTO notices (cluster_id, token_hash, event, text, created_at)
+                 SELECT ?1, token_hash, ?2, ?3, ?4 FROM follows WHERE cluster_id = ?1",
+            params![id, event, text, at as i64],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Like `mark_fixed_and_notify`, but for a fix that came from the board
+    /// reaching `done`: also flags the state as board-driven so a later board
+    /// reopen re-derives it, while an admin mark-fixed is left alone.
+    pub fn mark_fixed_from_board_and_notify(
+        &self,
+        id: i64,
+        version: Option<&str>,
+        event: &str,
+        text: &str,
+        at: u64,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE clusters SET status = 'fixed', fixed_in = coalesce(?2, fixed_in),
+             board_fixed = 1
+             WHERE id = ?1 AND merged_into IS NULL",
+            params![id, version],
+        )? > 0;
+        tx.execute(
+            "INSERT OR IGNORE INTO notices (cluster_id, token_hash, event, text, created_at)
+                 SELECT ?1, token_hash, ?2, ?3, ?4 FROM follows WHERE cluster_id = ?1",
+            params![id, event, text, at as i64],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Confirm a beta or stable release and queue its notices in one
+    /// transaction (same ordering and planning checks as
+    /// `mark_release_confirmed`).
+    pub fn confirm_and_notify(
+        &self,
+        id: i64,
+        channel: &str,
+        version: &str,
+        event: &str,
+        text: &str,
+        at: u64,
+    ) -> Result<bool> {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+            return Ok(false);
+        }
+        let (column, target) = if channel == "beta" {
+            ("confirmed_beta", "target_beta")
+        } else {
+            ("confirmed_stable", "target_stable")
+        };
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let planned: Option<Option<String>> = tx
+            .query_row(
+                &format!("SELECT {target} FROM clusters WHERE id = ?1 AND merged_into IS NULL"),
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if !matches!(planned, Some(Some(_))) {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            &format!("UPDATE clusters SET {column} = ?2 WHERE id = ?1 AND merged_into IS NULL"),
+            params![id, version],
+        )? > 0;
+        tx.execute(
+            "INSERT OR IGNORE INTO notices (cluster_id, token_hash, event, text, created_at)
+                 SELECT ?1, token_hash, ?2, ?3, ?4 FROM follows WHERE cluster_id = ?1",
+            params![id, event, text, at as i64],
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really

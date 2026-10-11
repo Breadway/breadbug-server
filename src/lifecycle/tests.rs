@@ -111,28 +111,32 @@ fn notice_text_names_app_version_and_stage_per_kind() {
     };
     assert_eq!(
         super::notice_text(&c, "fixed", Some("1.3.0")),
-        "A bug you follow has been fixed in bar 1.3.0. Thanks for helping us improve it!"
+        "A bug you follow in bar has been fixed in 1.3.0. Thanks for helping us improve it!"
     );
     assert_eq!(
         super::notice_text(&c, "beta", Some("1.4-beta1")),
-        "A bug you follow is available in the bar 1.4-beta1 beta."
+        "A bug you follow in bar is available in the 1.4-beta1 beta."
     );
     assert_eq!(
         super::notice_text(&c, "stable", Some("1.4")),
-        "A bug you follow is available in bar 1.4 stable."
+        "A bug you follow in bar is available in 1.4 stable."
     );
     c.kind = "request".into();
     assert_eq!(
         super::notice_text(&c, "fixed", Some("2.0")),
-        "A feature you follow has been implemented in bar 2.0. Thanks for helping us improve it!"
+        "A feature you follow in bar has been implemented in 2.0. Thanks for helping us improve it!"
     );
     assert_eq!(
         super::notice_text(&c, "stable", Some("2.0")),
-        "A feature you follow is available in bar 2.0 stable."
+        "A feature you follow in bar is available in 2.0 stable."
     );
-    // Board-detected fixes carry no version: still a complete sentence.
+    // Board-detected fixes carry no version: still names the app and stage.
     assert_eq!(
         super::notice_text(&c, "fixed", None),
-        "A feature you follow has been implemented. Thanks for helping us improve it!"
+        "A feature you follow in bar has been implemented. Thanks for helping us improve it!"
+    );
+    assert_eq!(
+        super::notice_text(&c, "beta", None),
+        "A feature you follow in bar is available in the beta channel."
     );
 }

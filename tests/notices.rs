@@ -94,6 +94,32 @@ async fn notices(h: &H, token: &str) -> (StatusCode, Value) {
     .await
 }
 
+async fn ack(h: &H, token: &str, ids: &[i64]) -> StatusCode {
+    let body = json!({ "ids": ids }).to_string();
+    public(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/follows/{token}/notifications/ack"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .0
+}
+
+async fn wait(h: &H, token: &str) -> (StatusCode, Value) {
+    public(
+        h,
+        Request::builder()
+            .uri(format!("/v1/follows/{token}/notifications/wait"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
 async fn admin_post(h: &H, uri: &str, form: &str) -> StatusCode {
     admin_router(h.st.clone())
         .oneshot(
@@ -110,65 +136,91 @@ async fn admin_post(h: &H, uri: &str, form: &str) -> StatusCode {
         .status()
 }
 
+fn ids_of(v: &Value) -> Vec<i64> {
+    v["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_i64())
+        .collect()
+}
+
 #[tokio::test]
-async fn fixed_beta_stable_each_notify_once_and_drain_on_read() {
+async fn notices_are_peeked_and_acked_and_each_transition_notifies_once() {
     let h = harness();
     let receipt = submit(&h, INSTALL_A).await;
     let id = h.st.db.clusters().unwrap()[0].id;
     let token_a = follow(&h, &receipt, INSTALL_A).await;
     let token_b = follow(&h, &receipt, INSTALL_B).await;
 
-    // Nothing happened yet: empty list, and it stays empty.
-    assert_eq!(notices(&h, &token_a).await.1, json!({"notices": []}),);
+    // Nothing happened yet: empty list.
+    assert_eq!(notices(&h, &token_a).await.1, json!({"notices": []}));
 
-    // Mark fixed: both follows get exactly one notice with app and version.
+    // Mark fixed: one notice, with app, version and a stable id.
     assert_eq!(
         admin_post(&h, &format!("/admin/clusters/{id}/fixed"), "version=1.3.1").await,
         StatusCode::SEE_OTHER
     );
-    let (_, first) = notices(&h, &token_a).await;
+    let (status, first) = notices(&h, &token_a).await;
+    assert_eq!(status, StatusCode::OK);
     let list = first["notices"].as_array().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["event"], json!("fixed"));
+    assert!(list[0]["id"].is_number());
     assert_eq!(
         list[0]["text"],
-        json!("A bug you follow has been fixed in bar 1.3.1. Thanks for helping us improve it!")
+        json!("A bug you follow in bar has been fixed in 1.3.1. Thanks for helping us improve it!")
     );
-    assert!(list[0]["at"].is_number());
-    // Drain on read: a retry finds nothing, so nothing is sent twice.
+    let nid = list[0]["id"].as_i64().unwrap();
+
+    // Reading without acking keeps the notice: a lost response does not lose
+    // it, and the id is stable.
+    let again = notices(&h, &token_a).await.1;
+    assert_eq!(ids_of(&again), vec![nid]);
+
+    // Ack it: now it is gone.
+    assert_eq!(ack(&h, &token_a, &[nid]).await, StatusCode::OK);
     assert_eq!(notices(&h, &token_a).await.1, json!({"notices": []}));
-    // Repeating the identical transition does not duplicate either.
+
+    // Repeating the identical transition does not create a new notice.
     assert_eq!(
         admin_post(&h, &format!("/admin/clusters/{id}/fixed"), "version=1.3.1").await,
         StatusCode::SEE_OTHER
     );
     assert_eq!(notices(&h, &token_a).await.1, json!({"notices": []}));
-    // A new fix version is new information and notifies again.
+
+    // A new fix version is new information.
     assert_eq!(
         admin_post(&h, &format!("/admin/clusters/{id}/fixed"), "version=1.3.2").await,
         StatusCode::SEE_OTHER
     );
-    let (_, again) = notices(&h, &token_a).await;
-    let list = again["notices"].as_array().unwrap();
+    let list = notices(&h, &token_a).await.1["notices"]
+        .as_array()
+        .cloned()
+        .unwrap();
     assert_eq!(list.len(), 1);
     assert!(list[0]["text"].as_str().unwrap().contains("1.3.2"));
-    // The other follow never drained, so both fix versions are pending there.
-    let (_, b) = notices(&h, &token_b).await;
-    let blist = b["notices"].as_array().unwrap();
+
+    // B never read or acked, so both fix versions are pending there.
+    let blist = notices(&h, &token_b).await.1["notices"]
+        .as_array()
+        .cloned()
+        .unwrap();
     assert_eq!(blist.len(), 2);
     assert!(blist[0]["text"].as_str().unwrap().contains("1.3.1"));
     assert!(blist[1]["text"].as_str().unwrap().contains("1.3.2"));
 
+    // Clear A's pending fixed notices before the release steps.
+    let ids = ids_of(&notices(&h, &token_a).await.1);
+    assert_eq!(ack(&h, &token_a, &ids).await, StatusCode::OK);
+
     // Beta then stable: distinct notices, distinct wording.
-    assert_eq!(
-        admin_post(
-            &h,
-            &format!("/admin/clusters/{id}/release-target"),
-            "channel=beta&version=1.4-beta1"
-        )
-        .await,
-        StatusCode::SEE_OTHER
-    );
+    admin_post(
+        &h,
+        &format!("/admin/clusters/{id}/release-target"),
+        "channel=beta&version=1.4-beta1",
+    )
+    .await;
     assert_eq!(
         admin_post(
             &h,
@@ -178,21 +230,21 @@ async fn fixed_beta_stable_each_notify_once_and_drain_on_read() {
         .await,
         StatusCode::SEE_OTHER
     );
-    let (_, beta) = notices(&h, &token_a).await;
+    let beta = notices(&h, &token_a).await.1;
     assert_eq!(beta["notices"][0]["event"], json!("beta"));
     assert_eq!(
         beta["notices"][0]["text"],
-        json!("A bug you follow is available in the bar 1.4-beta2 beta.")
+        json!("A bug you follow in bar is available in the 1.4-beta2 beta.")
     );
-    assert_eq!(
-        admin_post(
-            &h,
-            &format!("/admin/clusters/{id}/release-target"),
-            "channel=stable&version=1.4"
-        )
-        .await,
-        StatusCode::SEE_OTHER
-    );
+    let bid = beta["notices"][0]["id"].as_i64().unwrap();
+    assert_eq!(ack(&h, &token_a, &[bid]).await, StatusCode::OK);
+
+    admin_post(
+        &h,
+        &format!("/admin/clusters/{id}/release-target"),
+        "channel=stable&version=1.4",
+    )
+    .await;
     assert_eq!(
         admin_post(
             &h,
@@ -202,12 +254,39 @@ async fn fixed_beta_stable_each_notify_once_and_drain_on_read() {
         .await,
         StatusCode::SEE_OTHER
     );
-    let (_, stable) = notices(&h, &token_a).await;
+    let stable = notices(&h, &token_a).await.1;
     assert_eq!(stable["notices"][0]["event"], json!("stable"));
     assert_eq!(
         stable["notices"][0]["text"],
-        json!("A bug you follow is available in bar 1.4 stable.")
+        json!("A bug you follow in bar is available in 1.4 stable.")
     );
+}
+
+#[tokio::test]
+async fn wait_returns_pending_notices_without_consuming_them() {
+    let h = harness();
+    let receipt = submit(&h, INSTALL_A).await;
+    let id = h.st.db.clusters().unwrap()[0].id;
+    let token = follow(&h, &receipt, INSTALL_A).await;
+    assert_eq!(
+        admin_post(&h, &format!("/admin/clusters/{id}/fixed"), "version=1.3.1").await,
+        StatusCode::SEE_OTHER
+    );
+
+    let (status, body) = wait(&h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["notices"].as_array().unwrap().len(), 1);
+    // The wait does not consume: the notice is still pending until acked.
+    assert_eq!(
+        notices(&h, &token).await.1["notices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert_eq!(wait(&h, "nope").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(ack(&h, &"0".repeat(64), &[1]).await, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

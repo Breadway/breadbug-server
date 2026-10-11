@@ -363,22 +363,24 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
 /// and version, and says which stage was reached: fixed in development, out
 /// in beta, or available in stable.
 pub fn notice_text(c: &ClusterRow, event: &str, version: Option<&str>) -> String {
-    let thing = match c.kind.as_str() {
-        "request" => "A feature you follow",
-        _ => "A bug you follow",
+    let (thing, done) = match c.kind.as_str() {
+        "request" => ("A feature you follow", "has been implemented"),
+        _ => ("A bug you follow", "has been fixed"),
     };
-    let done = match c.kind.as_str() {
-        "request" => "has been implemented",
-        _ => "has been fixed",
-    };
-    let v = version
-        .map(|v| format!(" {} {}", c.app, v))
-        .unwrap_or_default();
-    match event {
-        "beta" => format!("{thing} is available in the{v} beta."),
-        "stable" => format!("{thing} is available in{v} stable."),
-        _ if v.is_empty() => format!("{thing} {done}. Thanks for helping us improve it!"),
-        _ => format!("{thing} {done} in{v}. Thanks for helping us improve it!"),
+    // Always name the app and the stage, even when no version is known yet.
+    match (event, version) {
+        ("beta", Some(v)) => format!("{thing} in {} is available in the {v} beta.", c.app),
+        ("beta", None) => format!("{thing} in {} is available in the beta channel.", c.app),
+        ("stable", Some(v)) => format!("{thing} in {} is available in {v} stable.", c.app),
+        ("stable", None) => format!("{thing} in {} is available in the stable channel.", c.app),
+        (_, Some(v)) => format!(
+            "{thing} in {} {done} in {v}. Thanks for helping us improve it!",
+            c.app
+        ),
+        (_, None) => format!(
+            "{thing} in {} {done}. Thanks for helping us improve it!",
+            c.app
+        ),
     }
 }
 
@@ -413,18 +415,25 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
         };
         let _ = s.db.set_issue_status(id, &state.status);
         let Some(c) = s.db.cluster(id)? else { continue };
-<<<<<<< HEAD
         let live = matches!(
             c.status.as_str(),
             "promoted" | "regressed" | "investigating" | "new"
         );
         if state.status == "done" {
             if live {
-                // Persist the board's fix version when it records one, and
-                // flag the state as board-driven so a later reopen re-derives
-                // it while an admin mark-fixed (which records a version) is
-                // left alone.
-                s.db.mark_fixed_from_board(id, state.fix_version.as_deref())?;
+                // Persist the board's fix version when it records one, flag
+                // the state as board-driven so a later reopen re-derives it,
+                // and queue the notices in the same transaction so a crash
+                // cannot lose them.
+                let text = notice_text(&c, "fixed", state.fix_version.as_deref());
+                s.db.mark_fixed_from_board_and_notify(
+                    id,
+                    state.fix_version.as_deref(),
+                    "fixed",
+                    &text,
+                    crate::app::now_unix(),
+                )?;
+                let _ = s.notice_wake().send(());
                 changed += 1;
             }
         } else if c.status == "fixed" && c.board_fixed {
