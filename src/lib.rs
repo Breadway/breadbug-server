@@ -4,9 +4,11 @@
 //! `docs/threat-model.md`.
 
 pub mod app;
+pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod fingerprint;
 pub mod ratelimit;
 pub mod rescrub;
 pub mod schema;

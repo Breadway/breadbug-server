@@ -23,8 +23,73 @@ pub struct NewReport<'a> {
     pub raw: &'a str,
 }
 
+/// `(id, token_hash, install_hash, cluster_id, app_version, raw)`.
+type DeleteRow = (i64, String, String, Option<i64>, Option<String>, String);
+
+/// A stored report, for maintenance jobs.
+pub struct StoredReport {
+    pub id: i64,
+    pub install_hash: String,
+    pub app_version: Option<String>,
+    pub cluster_id: Option<i64>,
+    pub raw: String,
+}
+
+/// What a report contributes to a cluster.
+pub struct Contribution<'a> {
+    pub report_id: i64,
+    pub install_hash: &'a str,
+    pub version: Option<&'a str>,
+    pub os_build: Option<&'a str>,
+    pub at: u64,
+}
+
+/// A cluster as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRow {
+    pub id: i64,
+    pub app: String,
+    pub kind: String,
+    pub fingerprint: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub count: u64,
+    pub installs: u64,
+    pub versions: std::collections::BTreeMap<String, u64>,
+    pub os_builds: std::collections::BTreeMap<String, u64>,
+    pub fixed_in: Option<String>,
+    pub issue_key: Option<String>,
+    pub merged_into: Option<i64>,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+fn bump(map_json: &str, key: Option<&str>) -> String {
+    let mut m: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(map_json).unwrap_or_default();
+    if let Some(k) = key {
+        *m.entry(k.chars().take(64).collect()).or_default() += 1;
+    }
+    serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+}
+
+fn unbump(map_json: &str, key: Option<&str>) -> String {
+    let mut m: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(map_json).unwrap_or_default();
+    if let Some(k) = key {
+        let k: String = k.chars().take(64).collect();
+        if let Some(n) = m.get_mut(&k) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&k);
+            }
+        }
+    }
+    serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -47,6 +112,31 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX reports_received ON reports(received_at);
     CREATE UNIQUE INDEX reports_dedupe ON reports(install_hash, payload_sha);
     CREATE INDEX reports_app ON reports(app, received_at);",
+    // 2: clusters
+    "ALTER TABLE reports ADD COLUMN cluster_id INTEGER;
+    CREATE TABLE clusters (
+        id          INTEGER PRIMARY KEY,
+        app         TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        fingerprint TEXT,
+        title       TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'new',
+        first_seen  INTEGER NOT NULL,
+        last_seen   INTEGER NOT NULL,
+        count       INTEGER NOT NULL DEFAULT 0,
+        versions    TEXT NOT NULL DEFAULT '{}',
+        os_builds   TEXT NOT NULL DEFAULT '{}',
+        fixed_in    TEXT,
+        issue_key   TEXT,
+        merged_into INTEGER
+    );
+    CREATE UNIQUE INDEX clusters_fp ON clusters(app, fingerprint) WHERE fingerprint IS NOT NULL;
+    CREATE TABLE cluster_installs (
+        cluster_id   INTEGER NOT NULL,
+        install_hash TEXT NOT NULL,
+        PRIMARY KEY (cluster_id, install_hash)
+    );
+    CREATE INDEX reports_cluster ON reports(cluster_id);",
 ];
 
 impl Db {
@@ -117,23 +207,138 @@ impl Db {
     }
 
     /// Delete a report if `token_hash` matches. Returns whether it existed
-    /// and matched; a wrong token and an unknown receipt look the same.
+    /// and matched; a wrong token and an unknown receipt look the same. The
+    /// report's cluster count (and per-version counts) go down with it.
     pub fn delete_report(&self, receipt: &str, token_hash: &str) -> Result<bool> {
         let conn = self.conn();
-        let stored: Option<String> = conn
+        let row: Option<DeleteRow> = conn
             .query_row(
-                "SELECT token_hash FROM reports WHERE receipt = ?1",
+                "SELECT id, token_hash, install_hash, cluster_id, app_version, raw
+                 FROM reports WHERE receipt = ?1",
                 params![receipt],
-                |r| r.get(0),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        match stored {
-            Some(h) if ct_eq(&h, token_hash) => {
-                conn.execute("DELETE FROM reports WHERE receipt = ?1", params![receipt])?;
-                Ok(true)
-            }
-            _ => Ok(false),
+        let Some((id, stored, install, cluster, version, raw)) = row else {
+            return Ok(false);
+        };
+        if !ct_eq(&stored, token_hash) {
+            return Ok(false);
         }
+        let tx = conn.unchecked_transaction()?;
+        Self::detach(&tx, id, cluster, &install, version.as_deref(), &raw)?;
+        tx.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Take a report out of its cluster's counters (the report row itself is
+    /// left to the caller).
+    fn detach(
+        tx: &Connection,
+        report_id: i64,
+        cluster: Option<i64>,
+        install: &str,
+        version: Option<&str>,
+        raw: &str,
+    ) -> Result<()> {
+        let Some(cid) = cluster else {
+            return Ok(());
+        };
+        let os_build = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v["system"]["os_build"].as_str().map(String::from));
+        let (versions, os_builds): (String, String) = tx.query_row(
+            "SELECT versions, os_builds FROM clusters WHERE id = ?1",
+            params![cid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.execute(
+            "UPDATE clusters SET count = max(0, count - 1), versions = ?2, os_builds = ?3
+             WHERE id = ?1",
+            params![
+                cid,
+                unbump(&versions, version),
+                unbump(&os_builds, os_build.as_deref())
+            ],
+        )?;
+        let others: i64 = tx.query_row(
+            "SELECT count(*) FROM reports WHERE cluster_id = ?1 AND install_hash = ?2 AND id != ?3",
+            params![cid, install, report_id],
+            |r| r.get(0),
+        )?;
+        if others == 0 {
+            tx.execute(
+                "DELETE FROM cluster_installs WHERE cluster_id = ?1 AND install_hash = ?2",
+                params![cid, install],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every clean (non-quarantined) report, for re-fingerprinting.
+    pub fn clusterable_reports(&self) -> Result<Vec<StoredReport>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, install_hash, app_version, cluster_id, raw FROM reports
+             WHERE quarantined = 0 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StoredReport {
+                    id: r.get(0)?,
+                    install_hash: r.get(1)?,
+                    app_version: r.get(2)?,
+                    cluster_id: r.get(3)?,
+                    raw: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Move a report out of its current cluster; the caller re-assigns it.
+    pub fn detach_report(&self, r: &StoredReport) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        Self::detach(
+            &tx,
+            r.id,
+            r.cluster_id,
+            &r.install_hash,
+            r.app_version.as_deref(),
+            &r.raw,
+        )?;
+        tx.execute(
+            "UPDATE reports SET cluster_id = NULL WHERE id = ?1",
+            params![r.id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop clusters nothing points at, unless someone has acted on them.
+    pub fn prune_empty_clusters(&self) -> Result<usize> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "DELETE FROM clusters WHERE count = 0 AND status = 'new' AND issue_key IS NULL
+               AND NOT EXISTS (SELECT 1 FROM clusters m WHERE m.merged_into = clusters.id)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM cluster_installs WHERE cluster_id NOT IN (SELECT id FROM clusters)",
+            [],
+        )?;
+        Ok(n)
     }
 
     /// Delete raw reports received before `cutoff_unix`. Returns the count.
@@ -203,6 +408,194 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Test hook: overwrite a cluster's fingerprint to simulate older rules.
+    #[doc(hidden)]
+    pub fn corrupt_fingerprint_for_test(&self, id: i64, fp: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET fingerprint = ?2 WHERE id = ?1",
+            params![id, fp],
+        )?;
+        Ok(())
+    }
+
+    /// Follow `merged_into` to the live cluster.
+    fn resolve(conn: &Connection, mut id: i64) -> Result<i64> {
+        for _ in 0..8 {
+            let next: Option<i64> = conn
+                .query_row(
+                    "SELECT merged_into FROM clusters WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            match next {
+                Some(n) => id = n,
+                None => break,
+            }
+        }
+        Ok(id)
+    }
+
+    fn attach(conn: &Connection, cluster_id: i64, c: &Contribution<'_>) -> Result<i64> {
+        let cluster_id = Self::resolve(conn, cluster_id)?;
+        let (versions, os_builds): (String, String) = conn.query_row(
+            "SELECT versions, os_builds FROM clusters WHERE id = ?1",
+            params![cluster_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        conn.execute(
+            "UPDATE clusters SET count = count + 1, last_seen = max(last_seen, ?2),
+                                 first_seen = min(first_seen, ?2), versions = ?3, os_builds = ?4
+             WHERE id = ?1",
+            params![
+                cluster_id,
+                c.at as i64,
+                bump(&versions, c.version),
+                bump(&os_builds, c.os_build)
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO cluster_installs (cluster_id, install_hash) VALUES (?1, ?2)",
+            params![cluster_id, c.install_hash],
+        )?;
+        conn.execute(
+            "UPDATE reports SET cluster_id = ?2 WHERE id = ?1",
+            params![c.report_id, cluster_id],
+        )?;
+        Ok(cluster_id)
+    }
+
+    /// Put a report in the cluster for `fingerprint`, creating it if new.
+    pub fn assign_fingerprint(
+        &self,
+        app: &str,
+        kind: &str,
+        fingerprint: &str,
+        title: &str,
+        c: &Contribution<'_>,
+    ) -> Result<i64> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM clusters WHERE app = ?1 AND fingerprint = ?2",
+                params![app, fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO clusters (app, kind, fingerprint, title, first_seen, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![app, kind, fingerprint, title, c.at as i64],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        let id = Self::attach(&tx, id, c)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Put a report in an existing cluster (fuzzy matching).
+    pub fn assign_to(&self, cluster_id: i64, c: &Contribution<'_>) -> Result<i64> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id = Self::attach(&tx, cluster_id, c)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Start a cluster with no fingerprint (fuzzy matching creates these).
+    pub fn new_cluster(
+        &self,
+        app: &str,
+        kind: &str,
+        title: &str,
+        c: &Contribution<'_>,
+    ) -> Result<i64> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO clusters (app, kind, fingerprint, title, first_seen, last_seen)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?4)",
+            params![app, kind, title, c.at as i64],
+        )?;
+        let id = tx.last_insert_rowid();
+        let id = Self::attach(&tx, id, c)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn cluster_from(conn: &Connection, id: i64) -> Result<Option<ClusterRow>> {
+        Ok(conn
+            .query_row(
+                "SELECT c.id, c.app, c.kind, c.fingerprint, c.title, c.status, c.first_seen,
+                        c.last_seen, c.count, c.versions, c.os_builds, c.fixed_in, c.issue_key,
+                        c.merged_into,
+                        (SELECT count(*) FROM cluster_installs i WHERE i.cluster_id = c.id)
+                 FROM clusters c WHERE c.id = ?1",
+                params![id],
+                |r| {
+                    let versions: String = r.get(9)?;
+                    let os_builds: String = r.get(10)?;
+                    Ok(ClusterRow {
+                        id: r.get(0)?,
+                        app: r.get(1)?,
+                        kind: r.get(2)?,
+                        fingerprint: r.get(3)?,
+                        title: r.get(4)?,
+                        status: r.get(5)?,
+                        first_seen: r.get::<_, i64>(6)? as u64,
+                        last_seen: r.get::<_, i64>(7)? as u64,
+                        count: r.get::<_, i64>(8)? as u64,
+                        versions: serde_json::from_str(&versions).unwrap_or_default(),
+                        os_builds: serde_json::from_str(&os_builds).unwrap_or_default(),
+                        fixed_in: r.get(11)?,
+                        issue_key: r.get(12)?,
+                        merged_into: r.get(13)?,
+                        installs: r.get::<_, i64>(14)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn cluster(&self, id: i64) -> Result<Option<ClusterRow>> {
+        Self::cluster_from(&self.conn(), id)
+    }
+
+    /// Clusters that are not merged away, newest activity first.
+    pub fn clusters(&self) -> Result<Vec<ClusterRow>> {
+        let conn = self.conn();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM clusters WHERE merged_into IS NULL ORDER BY last_seen DESC, id DESC")?
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(c) = Self::cluster_from(&conn, id)? {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn cluster_of(&self, receipt: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT cluster_id FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really

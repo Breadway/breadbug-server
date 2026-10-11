@@ -520,3 +520,190 @@ async fn disk_quota_evicts_oldest_compacts_and_accepts_new_intake() {
         .any(|w| w == b"quota-marker-1"));
     assert!(bytes.len() < 220 * 1024);
 }
+
+// ---- clustering ---------------------------------------------------------
+
+fn crash(version: &str, sym: &str, msg: &str, os_build: &str) -> Vec<u8> {
+    let mut v: Value = serde_json::from_str(FIXTURE).unwrap();
+    v["app"]["version"] = json!(version);
+    v["system"]["os_build"] = json!(os_build);
+    v["markers"][0]["frames"] = json!([
+        {"symbol": "core::panicking::panic::h1111111111111111"},
+        {"symbol": format!("{sym}::h{:016x}", version.len() as u64 * 7919)},
+        {"symbol": "clip::main::h3333333333333333"}
+    ]);
+    v["markers"][0]["message"] = json!(msg);
+    serde_json::to_vec(&v).unwrap()
+}
+
+fn post_as(install: &str, body: &[u8]) -> Request<Body> {
+    post(body, Some(install), Some(&sha256_hex(body)), None)
+}
+
+#[tokio::test]
+async fn the_same_bug_from_different_versions_and_installs_forms_one_cluster() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let msg = "called `Option::unwrap()` on a `None` value";
+    let a = crash("0.3.1", "clip::sync::run", msg, "rolling-a");
+    let b = crash("0.3.22", "clip::sync::run", msg, "rolling-b");
+    let (s1, _, r1) = call(&h, post_as(&"1".repeat(32), &a)).await;
+    let (s2, _, r2) = call(&h, post_as(&"2".repeat(32), &b)).await;
+    assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED));
+    let c1 = h
+        .state
+        .db
+        .cluster_of(r1["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let c2 = h
+        .state
+        .db
+        .cluster_of(r2["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(c1, c2);
+    let cluster = h.state.db.cluster(c1).unwrap().unwrap();
+    assert_eq!(cluster.count, 2);
+    assert_eq!(cluster.installs, 2);
+    assert_eq!(cluster.versions.len(), 2);
+    assert_eq!(cluster.os_builds.len(), 2);
+    assert_eq!(cluster.kind, "crash");
+    assert_eq!(cluster.title, "called `Option::unwrap()` on a `None` value");
+    assert_eq!(h.state.db.clusters().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_different_bug_gets_its_own_cluster() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let msg = "boom";
+    let (_, _, r1) = call(
+        &h,
+        post_as(&"1".repeat(32), &crash("0.3", "clip::sync::run", msg, "x")),
+    )
+    .await;
+    let (_, _, r2) = call(
+        &h,
+        post_as(&"1".repeat(32), &crash("0.3", "clip::paste::run", msg, "x")),
+    )
+    .await;
+    let c1 = h
+        .state
+        .db
+        .cluster_of(r1["receipt"].as_str().unwrap())
+        .unwrap();
+    let c2 = h
+        .state
+        .db
+        .cluster_of(r2["receipt"].as_str().unwrap())
+        .unwrap();
+    assert_ne!(c1, c2);
+    assert_eq!(h.state.db.clusters().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn quarantined_and_unfingerprintable_reports_are_not_clustered() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    // leaked PII -> quarantined -> stays out of clusters
+    let mut v: Value = serde_json::from_slice(&crash("0.3", "clip::a", "m", "x")).unwrap();
+    v["notes"] = json!("mail leak@example.org");
+    let (_, _, r) = call(
+        &h,
+        post_as(&"1".repeat(32), &serde_json::to_vec(&v).unwrap()),
+    )
+    .await;
+    assert_eq!(
+        h.state
+            .db
+            .cluster_of(r["receipt"].as_str().unwrap())
+            .unwrap(),
+        None
+    );
+    // behavior report with no evidence -> no fingerprint
+    let beh = json!({"schema":1,"report_type":"behavior","created_unix":1,"app":{"id":"clip"},"notes":"weird"});
+    let (status, _, r) = call(
+        &h,
+        post_as(&"2".repeat(32), &serde_json::to_vec(&beh).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        h.state
+            .db
+            .cluster_of(r["receipt"].as_str().unwrap())
+            .unwrap(),
+        None
+    );
+    assert!(h.state.db.clusters().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deleting_a_report_shrinks_its_cluster() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let body = crash("0.3", "clip::sync::run", "boom", "x");
+    let (_, _, r1) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    let mut other = serde_json::from_slice::<Value>(&body).unwrap();
+    other["created_unix"] = json!(5);
+    let (_, _, r2) = call(
+        &h,
+        post_as(&"2".repeat(32), &serde_json::to_vec(&other).unwrap()),
+    )
+    .await;
+    let cid = h
+        .state
+        .db
+        .cluster_of(r1["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.state.db.cluster(cid).unwrap().unwrap().count, 2);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/reports/{}", r1["receipt"].as_str().unwrap()))
+        .header(
+            "authorization",
+            format!("Bearer {}", r1["deletion_token"].as_str().unwrap()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(call(&h, req).await.0, StatusCode::NO_CONTENT);
+    let c = h.state.db.cluster(cid).unwrap().unwrap();
+    assert_eq!((c.count, c.installs), (1, 1));
+    assert_eq!(c.versions.get("0.3"), Some(&1));
+    let _ = r2;
+}
+
+#[tokio::test]
+async fn refingerprint_moves_reports_when_rules_change_and_is_a_noop_otherwise() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let (_, _, r) = call(
+        &h,
+        post_as(
+            &"1".repeat(32),
+            &crash("0.3", "clip::sync::run", "boom", "x"),
+        ),
+    )
+    .await;
+    let receipt = r["receipt"].as_str().unwrap();
+    let before = h.state.db.cluster_of(receipt).unwrap().unwrap();
+    // Unchanged rules: nothing moves.
+    assert_eq!(
+        breadbug_server::cluster::refingerprint_all(&h.state.db).unwrap(),
+        0
+    );
+    assert_eq!(h.state.db.cluster_of(receipt).unwrap(), Some(before));
+    // Simulate an old rule set: point the report at a cluster with a stale fingerprint.
+    h.state
+        .db
+        .corrupt_fingerprint_for_test(before, "stale-fingerprint")
+        .unwrap();
+    assert_eq!(
+        breadbug_server::cluster::refingerprint_all(&h.state.db).unwrap(),
+        1
+    );
+    let after = h.state.db.cluster_of(receipt).unwrap().unwrap();
+    assert_ne!(after, before);
+    assert_eq!(h.state.db.cluster(after).unwrap().unwrap().count, 1);
+    // The emptied stale cluster was pruned.
+    assert!(h.state.db.cluster(before).unwrap().is_none());
+    assert_eq!(h.state.db.clusters().unwrap().len(), 1);
+}

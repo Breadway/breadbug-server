@@ -216,7 +216,7 @@ fn store_report(
 
     let receipt = random_hex(16);
     let token = random_hex(32);
-    s.db.insert_report(&NewReport {
+    let report_id = s.db.insert_report(&NewReport {
         receipt: &receipt,
         token_hash: &sha256_hex(token.as_bytes()),
         install_hash,
@@ -229,6 +229,12 @@ fn store_report(
         rescrub_hits: &hits,
         raw: &raw,
     })?;
+    // Quarantined reports stay out of clustering until someone reviews them.
+    if outcome.clean() {
+        if let Err(e) = crate::cluster::assign(&s.db, report_id, report, install_hash) {
+            tracing::error!(error = %e, "clustering failed; the report is stored unclustered");
+        }
+    }
     Ok((
         StatusCode::CREATED,
         Json(json!({ "receipt": receipt, "deletion_token": token, "status": "received" })),
