@@ -55,6 +55,9 @@ pub struct Config {
     pub board_token: Option<String>,
     /// `app=PROJECT,...` overrides for the app to project mapping.
     pub board_projects: String,
+    /// Public base URL of this server's cluster pages. When set, a promoted
+    /// issue body links back to the cluster at `<cluster_url>/<id>`. Optional.
+    pub cluster_url: Option<String>,
     /// Run lifecycle follow-ups (breadboard comments, regression checks)
     /// before answering instead of on a background thread. For tests.
     pub lifecycle_inline: bool,
@@ -83,6 +86,7 @@ impl Default for Config {
             board_url: None,
             board_token: None,
             board_projects: String::new(),
+            cluster_url: None,
             lifecycle_inline: false,
         }
     }
@@ -157,6 +161,10 @@ impl Config {
         c.board_url = std::env::var("BREADBUG_BOARD_URL")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        c.cluster_url = std::env::var("BREADBUG_CLUSTER_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
         c.board_token = match env_parse::<PathBuf>("BREADBUG_BOARD_TOKEN_FILE")? {
             Some(path) => Some(
                 std::fs::read_to_string(&path)

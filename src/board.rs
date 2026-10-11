@@ -178,13 +178,37 @@ impl BoardClient {
 
     /// The issue's workflow status (`done`, `review`, ...).
     pub fn status(&self, key: &str) -> Result<String> {
+        Ok(self.issue_state(key)?.status)
+    }
+
+    /// The issue's workflow status plus the fix version the board records,
+    /// if any. The version is read from a `fix_version` field, accepted at
+    /// the top level of the reply or under `issue`.
+    pub fn issue_state(&self, key: &str) -> Result<IssueState> {
         let v = self.call("GET", &format!("/issues/{}", safe_key(key)?), None)?;
-        v["status"]
+        let status = v["status"]
             .as_str()
             .or_else(|| v["issue"]["status"].as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow!("breadboard reply had no status"))
+            .ok_or_else(|| anyhow!("breadboard reply had no status"))?;
+        let fix_version = v["fix_version"]
+            .as_str()
+            .or_else(|| v["issue"]["fix_version"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .map(String::from);
+        Ok(IssueState {
+            status,
+            fix_version,
+        })
     }
+}
+
+/// The workflow status plus the recorded fix version for one board issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueState {
+    pub status: String,
+    pub fix_version: Option<String>,
 }
 
 fn safe_key(key: &str) -> Result<&str> {

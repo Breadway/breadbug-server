@@ -30,6 +30,8 @@ struct Mock {
     seen: Arc<Mutex<Vec<Req>>>,
     issue_status: Arc<Mutex<String>>,
     fail_create: Arc<Mutex<bool>>,
+    fix_version: Arc<Mutex<Option<String>>>,
+    fail_writes: Arc<Mutex<bool>>,
 }
 
 fn mock_board() -> Mock {
@@ -38,7 +40,10 @@ fn mock_board() -> Mock {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let issue_status = Arc::new(Mutex::new("backlog".to_string()));
     let fail_create = Arc::new(Mutex::new(false));
+    let fix_version = Arc::new(Mutex::new(None));
+    let fail_writes = Arc::new(Mutex::new(false));
     let (s2, st2, f2) = (seen.clone(), issue_status.clone(), fail_create.clone());
+    let (fv2, fw2) = (fix_version.clone(), fail_writes.clone());
     std::thread::spawn(move || {
         let mut next_issue = 9;
         for stream in listener.incoming() {
@@ -87,8 +92,15 @@ fn mock_board() -> Mock {
                         json!({"key": format!("CLIP-{}", next_issue - 1), "status": "backlog"}),
                     )
                 }
+                ("POST" | "PATCH", p) if p.starts_with("/api/issues/") && *fw2.lock().unwrap() => {
+                    (500, json!({}))
+                }
                 ("GET", p) if p.starts_with("/api/issues/") => {
-                    (200, json!({"status": st2.lock().unwrap().clone()}))
+                    let mut v = json!({"status": st2.lock().unwrap().clone()});
+                    if let Some(fv) = fv2.lock().unwrap().clone() {
+                        v["fix_version"] = json!(fv);
+                    }
+                    (200, v)
                 }
                 _ => (200, json!({})),
             };
@@ -106,6 +118,8 @@ fn mock_board() -> Mock {
         seen,
         issue_status,
         fail_create,
+        fix_version,
+        fail_writes,
     }
 }
 
@@ -119,6 +133,7 @@ fn state(board: Option<&Mock>) -> (Arc<AppState>, tempfile::TempDir) {
         admin_token_sha256: Some(sha256_hex(b"tok")),
         board_url: board.map(|b| b.url.clone()),
         board_token: board.map(|_| "board-secret-token".to_string()),
+        cluster_url: Some("https://bug.example/admin/clusters".to_string()),
         lifecycle_inline: true,
         ..Config::default()
     };
@@ -201,6 +216,7 @@ async fn promote_files_an_issue_with_how_found_confidence_and_inert_evidence() {
         "1 report(s) from 1 install(s)",
         "clip::sync::run",
         "Cluster #",
+        "https://bug.example/admin/clusters/",
     ] {
         assert!(body.contains(needle), "missing {needle:?} in\n{body}");
     }
@@ -476,4 +492,92 @@ async fn the_board_token_never_appears_in_stored_data() {
     let raw = st.db.raw_of(&r).unwrap().unwrap();
     assert!(!raw.contains("board-secret-token"));
     drop(d);
+}
+
+async fn sync(st: &Arc<AppState>) {
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || sync_issue_states(&st2))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn promote_blocking(st: &Arc<AppState>, id: i64) -> String {
+    tokio::task::spawn_blocking({
+        let st = st.clone();
+        move || promote(&st, id)
+    })
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn done_with_a_fix_version_is_persisted_and_gates_regression() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r = post(&st, 1, &crash("0.3.1", "boom")).await;
+    let id = cluster_id(&st, &r);
+    promote_blocking(&st, id).await;
+
+    *m.issue_status.lock().unwrap() = "done".into();
+    *m.fix_version.lock().unwrap() = Some("0.4.0".into());
+    sync(&st).await;
+    let c = st.db.cluster(id).unwrap().unwrap();
+    assert_eq!(
+        (c.status.as_str(), c.fixed_in.as_deref()),
+        ("fixed", Some("0.4.0"))
+    );
+
+    // The recorded fix version is the regression threshold.
+    post(&st, 2, &crash("0.3.2", "boom")).await;
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().status, "fixed");
+    post(&st, 3, &crash("0.4.1", "boom")).await;
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().status, "regressed");
+}
+
+#[tokio::test]
+async fn regression_reopen_retries_after_a_board_outage() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r = post(&st, 1, &crash("0.3.1", "boom")).await;
+    let id = cluster_id(&st, &r);
+    promote_blocking(&st, id).await;
+    *m.issue_status.lock().unwrap() = "done".into();
+    *m.fix_version.lock().unwrap() = Some("0.4.0".into());
+    sync(&st).await;
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().status, "fixed");
+
+    // The board is down when a regression arrives: the cluster stays fixed
+    // so the reopen is not lost.
+    *m.fail_writes.lock().unwrap() = true;
+    post(&st, 2, &crash("0.4.1", "boom")).await;
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().status, "fixed");
+
+    // Board recovers: the next matching report completes the reopen.
+    *m.fail_writes.lock().unwrap() = false;
+    post(&st, 3, &crash("0.4.1", "boom")).await;
+    assert_eq!(st.db.cluster(id).unwrap().unwrap().status, "regressed");
+}
+
+#[tokio::test]
+async fn hostile_versions_and_os_builds_are_flattened_in_the_issue_body() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let mut v = crash("0.3.1", "boom");
+    v["app"]["version"] = json!("0.3\n## boom\n```");
+    v["system"]["os_build"] = json!("os-1\n### inject");
+    let r = post(&st, 1, &v).await;
+    let id = cluster_id(&st, &r);
+    promote_blocking(&st, id).await;
+    let creates = by_path(&m, "POST", "/api/issues");
+    let body = creates[0].body["body"].as_str().unwrap();
+    // No injected markdown heading survives on its own line.
+    assert!(
+        !body.lines().any(|l| l.trim_start().starts_with('#')),
+        "{body}"
+    );
+    // The hostile text is still present, flattened to one line.
+    assert!(body.contains("0.3 ## boom"), "{body}");
+    assert!(body.contains("os-1 ### inject"), "{body}");
 }

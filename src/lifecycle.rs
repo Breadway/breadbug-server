@@ -65,17 +65,17 @@ fn one_line(s: &str, max: usize) -> String {
 }
 
 /// The issue body: how it was found, confidence, and what the bug is.
-pub fn issue_body(c: &ClusterRow, samples: &[String]) -> String {
+pub fn issue_body(c: &ClusterRow, samples: &[String], cluster_url: Option<&str>) -> String {
     let versions = c
         .versions
         .iter()
-        .map(|(v, n)| format!("{v} ({n})"))
+        .map(|(v, n)| format!("{} ({n})", one_line(v, 128)))
         .collect::<Vec<_>>()
         .join(", ");
     let os = c
         .os_builds
         .iter()
-        .map(|(v, n)| format!("{v} ({n})"))
+        .map(|(v, n)| format!("{} ({n})", one_line(v, 128)))
         .collect::<Vec<_>>()
         .join(", ");
     let mut b = String::new();
@@ -108,7 +108,13 @@ pub fn issue_body(c: &ClusterRow, samples: &[String]) -> String {
         b.push_str(&fenced(s));
         b.push_str("\n\n");
     }
-    b.push_str(&format!("Cluster #{} in breadbug-server.", c.id));
+    match cluster_url {
+        Some(base) => b.push_str(&format!(
+            "Cluster #{} in breadbug-server: {base}/{}",
+            c.id, c.id
+        )),
+        None => b.push_str(&format!("Cluster #{} in breadbug-server.", c.id)),
+    }
     b
 }
 
@@ -180,7 +186,7 @@ pub fn promote(s: &AppState, cluster_id: i64) -> Result<String> {
         let key = board.create_issue(
             &board.project_for(&c.app),
             &title,
-            &issue_body(&c, &samples),
+            &issue_body(&c, &samples, s.cfg.cluster_url.as_deref()),
             priority,
             &["breadbug", &c.kind],
         )?;
@@ -239,12 +245,17 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
             _ => false,
         };
         if newer {
-            s.db.set_status(cluster_id, "regressed")?;
+            // Do the board side effects before persisting the local state:
+            // if breadboard is down or errors, the cluster stays fixed and
+            // the next matching report retries the reopen instead of losing
+            // it. (A partial failure can repeat the comment, which is
+            // preferable to a silently dropped reopen.)
             if let (Some(board), Some(key)) = (s.board(), &key) {
                 let v = report_version.unwrap_or("?");
                 board.comment(key, &format!("Regression: a new report arrived from version `{v}`, which is not older than the fix. Reopening."))?;
                 board.reopen(key)?;
             }
+            s.db.set_status(cluster_id, "regressed")?;
         }
         return Ok(());
     }
@@ -289,14 +300,23 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     };
     let mut changed = 0;
     for (id, key) in s.db.tracked_issues()? {
-        let Ok(status) = board.status(&key) else {
+        let Ok(state) = board.issue_state(&key) else {
             continue;
         };
         let Some(c) = s.db.cluster(id)? else { continue };
-        if status == "done" && c.status != "fixed" {
-            // The fix version is unknown here; regression is then judged
-            // against versions already seen (see `after_report`).
-            s.db.set_status(id, "fixed")?;
+        if state.status == "done" && c.status != "fixed" {
+            // Persist the board's fix version when it records one, so the
+            // public "fixed in" and the regression threshold use it. With no
+            // version, regression is judged against versions already seen
+            // (see `after_report`).
+            match state.fix_version {
+                Some(v) => {
+                    s.db.mark_fixed(id, &v)?;
+                }
+                None => {
+                    s.db.set_status(id, "fixed")?;
+                }
+            }
             changed += 1;
         }
     }
