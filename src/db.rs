@@ -203,6 +203,16 @@ const MIGRATIONS: &[&str] = &[
     // 6: promotion bookkeeping
     "ALTER TABLE clusters ADD COLUMN notified_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE clusters ADD COLUMN issue_priority TEXT;",
+    // 7: anonymous follows: one row per (cluster, install), token stored hashed
+    "CREATE TABLE follows (
+        id           INTEGER PRIMARY KEY,
+        cluster_id   INTEGER NOT NULL,
+        token_hash   TEXT NOT NULL UNIQUE,
+        install_hash TEXT NOT NULL,
+        created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX follows_cluster ON follows(cluster_id);
+    CREATE UNIQUE INDEX follows_one_per_install ON follows(cluster_id, install_hash);",
 ];
 
 impl Db {
@@ -402,6 +412,10 @@ impl Db {
         )?;
         conn.execute(
             "DELETE FROM cluster_installs WHERE cluster_id NOT IN (SELECT id FROM clusters)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM follows WHERE cluster_id NOT IN (SELECT id FROM clusters)",
             [],
         )?;
         Ok(n)
@@ -752,6 +766,18 @@ impl Db {
             "UPDATE reports SET cluster_id = ?2 WHERE cluster_id = ?1",
             params![from, into],
         )?;
+        // Follows move with the reports. An install following both keeps its
+        // target follow; the duplicate source row goes away (that token stops
+        // working, the install is still subscribed through the surviving one).
+        tx.execute(
+            "DELETE FROM follows WHERE cluster_id = ?1 AND install_hash IN
+             (SELECT install_hash FROM follows WHERE cluster_id = ?2)",
+            params![from, into],
+        )?;
+        tx.execute(
+            "UPDATE follows SET cluster_id = ?2 WHERE cluster_id = ?1",
+            params![from, into],
+        )?;
         tx.execute(
             "UPDATE clusters SET merged_into = ?2, count = 0 WHERE id = ?1",
             params![from, into],
@@ -904,6 +930,19 @@ impl Db {
             params![id, fp],
         )?;
         Ok(())
+    }
+
+    /// Test hook: a report's row id for its receipt.
+    #[doc(hidden)]
+    pub fn report_id_for_test(&self, receipt: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Follow `merged_into` to the live cluster.
@@ -1082,6 +1121,39 @@ impl Db {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Follow a cluster. Returns false when this install already follows it
+    /// (the first follow token keeps working, no second one is issued).
+    pub fn follow(
+        &self,
+        cluster_id: i64,
+        token_hash: &str,
+        install_hash: &str,
+        at: u64,
+    ) -> Result<bool> {
+        Ok(self.conn().execute(
+            "INSERT OR IGNORE INTO follows (cluster_id, token_hash, install_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![cluster_id, token_hash, install_hash, at as i64],
+        )? > 0)
+    }
+
+    /// Stop following. Returns false for an unknown token.
+    pub fn unfollow(&self, token_hash: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM follows WHERE token_hash = ?1",
+            params![token_hash],
+        )? > 0)
+    }
+
+    /// How many installs follow a cluster.
+    pub fn follow_count(&self, cluster_id: i64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT count(*) FROM follows WHERE cluster_id = ?1",
+            params![cluster_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really

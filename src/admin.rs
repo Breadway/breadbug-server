@@ -422,6 +422,14 @@ async fn detail(
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
+    let followers = tokio::task::spawn_blocking({
+        let db = s.db.clone();
+        move || db.follow_count(id)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(0);
     if let Some(target) = c.merged_into {
         return html(
             StatusCode::OK,
@@ -452,9 +460,10 @@ async fn detail(
     b.push_str("</p>");
     let _ = write!(
         b,
-        "<p>{} report(s) from {} install(s), first {} last {}{}{}</p>",
+        "<p>{} report(s) from {} install(s), {} follower(s), first {} last {}{}{}</p>",
         c.count,
         c.installs,
+        followers,
         fmt_utc(c.first_seen),
         fmt_utc(c.last_seen),
         c.fixed_in

@@ -144,6 +144,8 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         .route("/v1/reports", post(post_report))
         .route("/v1/reports/{receipt}", delete(delete_report))
         .route("/v1/reports/{receipt}/status", get(report_status))
+        .route("/v1/reports/{receipt}/follow", post(follow_report))
+        .route("/v1/follows/{token}", delete(unfollow))
         .layer(DefaultBodyLimit::max(state.cfg.max_body_bytes))
         .with_state(state)
 }
@@ -448,6 +450,125 @@ async fn report_status(
             Json(body).into_response()
         }
         Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    }
+}
+
+/// Follow the cluster behind a report: anonymous, no account. The receipt is
+/// the capability that names the issue; anyone holding it may follow. Returns
+/// a follow token that later unsubscribes. Nothing about other followers is
+/// revealed.
+async fn follow_report(
+    State(s): State<Arc<AppState>>,
+    Path(receipt): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !valid_receipt(&receipt) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    let Some(install) = headers
+        .get("x-breadbug-install")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| valid_install_id(v))
+    else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "missing or invalid X-Breadbug-Install",
+        );
+    };
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let install_hash = hmac_hex(
+        &s.secret,
+        "install",
+        install.to_ascii_lowercase().as_bytes(),
+    );
+    {
+        let db = s.db.clone();
+        let hash = install_hash.clone();
+        match tokio::task::spawn_blocking(move || db.is_banned(&hash)).await {
+            Ok(Ok(true)) => return err(StatusCode::FORBIDDEN, "blocked"),
+            Ok(Ok(false)) => {}
+            _ => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not check the request",
+                )
+            }
+        }
+    }
+    let db = s.db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let cluster = db.cluster_of(&receipt)?;
+        let Some(cid) = cluster else {
+            // Unknown receipt (404) or a stored report with no group yet
+            // (409): tell them apart so clients know a retry may help.
+            let known = db.status_of(&receipt)?.is_some();
+            return anyhow::Ok(Err(known));
+        };
+        // Follow the live target when clusters were merged.
+        let mut target = cid;
+        for _ in 0..16 {
+            match db.cluster(target)? {
+                Some(c) => match c.merged_into {
+                    Some(t) => target = t,
+                    None => break,
+                },
+                None => break,
+            }
+        }
+        let token = random_hex(32);
+        let added = db.follow(
+            target,
+            &sha256_hex(token.as_bytes()),
+            &install_hash,
+            now_unix(),
+        )?;
+        anyhow::Ok(Ok((added, token)))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(Ok((true, token)))) => (
+            StatusCode::CREATED,
+            Json(json!({ "follow_token": token, "status": "following" })),
+        )
+            .into_response(),
+        Ok(Ok(Ok((false, _)))) => (
+            StatusCode::OK,
+            Json(json!({ "status": "following", "duplicate": true })),
+        )
+            .into_response(),
+        Ok(Ok(Err(true))) => err(StatusCode::CONFLICT, "report is not grouped yet"),
+        Ok(Ok(Err(false))) => err(StatusCode::NOT_FOUND, "not found"),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    }
+}
+
+/// Stop following with a follow token. Unknown tokens are 404, same as an
+/// unknown receipt, so tokens cannot be probed for anything but validity.
+async fn unfollow(
+    State(s): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || db.unfollow(&token_hash)).await {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => err(StatusCode::NOT_FOUND, "not found"),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
     }
 }
