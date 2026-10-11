@@ -1,0 +1,22 @@
+{
+  "notices": [
+    {
+      "id": 1,
+      "event": "fixed",
+      "text": "A bug you follow in bar has been fixed in 1.4.0. Thanks for helping us improve it!",
+      "at": 1720000000
+    },
+    {
+      "id": 2,
+      "event": "beta",
+      "text": "A bug you follow in bar is available in the 1.4.1-beta1 beta.",
+      "at": 1720000001
+    },
+    {
+      "id": 3,
+      "event": "stable",
+      "text": "A bug you follow in bar is available in 1.4.1 stable.",
+      "at": 1720000002
+    }
+  ]
+}

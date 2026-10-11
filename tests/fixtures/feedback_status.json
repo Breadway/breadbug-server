@@ -1,0 +1,15 @@
+{
+  "status": "investigating",
+  "progress": "in_development",
+  "releases": {
+    "beta": {
+      "planned": "1.4-beta1",
+      "shipped": true,
+      "shipped_in": "1.4-beta2"
+    },
+    "stable": {
+      "planned": "1.4",
+      "shipped": false
+    }
+  }
+}
