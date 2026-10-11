@@ -89,6 +89,10 @@ Checklist (nothing here is done by CI):
 is routed by the Aegis Caddy (see the infra repo). Nothing here is deployed
 by CI.
 
+Clients (BOS Settings and the bread apps) build against
+[docs/feedback-api.md](docs/feedback-api.md): the reporting, following,
+progress, release and notification contract with fixtures.
+
 See [docs/threat-model.md](docs/threat-model.md) and
 [CONTRIBUTING.md](CONTRIBUTING.md).
 # Backup and deletion contract
