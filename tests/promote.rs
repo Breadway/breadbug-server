@@ -154,6 +154,32 @@ fn crash(version: &str, msg: &str) -> Value {
     })
 }
 
+fn manual(title: &str, notes: &str) -> Value {
+    json!({
+        "schema": 1, "report_type": "manual", "created_unix": 1,
+        "app": {"id": "clip", "version": "0.3.1"},
+        "title": title, "notes": notes,
+    })
+}
+
+fn request(title: &str, want: &str, why: &str) -> Value {
+    json!({
+        "schema": 1, "report_type": "request", "created_unix": 1,
+        "app": {"id": "clip", "version": "0.3.1"},
+        "title": title, "want": want, "notes": why,
+    })
+}
+
+async fn promote_blocking(st: &Arc<AppState>, id: i64) -> String {
+    tokio::task::spawn_blocking({
+        let st = st.clone();
+        move || promote(&st, id)
+    })
+    .await
+    .unwrap()
+    .unwrap()
+}
+
 async fn post(st: &Arc<AppState>, n: usize, v: &Value) -> String {
     let body = serde_json::to_vec(v).unwrap();
     let req = Request::builder()
@@ -227,6 +253,74 @@ async fn promote_files_an_issue_with_how_found_confidence_and_inert_evidence() {
     assert_eq!(
         (cluster.status.as_str(), cluster.issue_key.as_deref()),
         ("promoted", Some("CLIP-9"))
+    );
+}
+
+#[tokio::test]
+async fn promote_manual_and_request_clusters_carry_their_text() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r1 = post(
+        &st,
+        1,
+        &manual(
+            "Panel flickers on workspace switch",
+            "The top panel flickers for a second on every switch.",
+        ),
+    )
+    .await;
+    let r2 = post(
+        &st,
+        2,
+        &request(
+            "Dark mode for the panel",
+            "A dark theme option for the top panel.",
+            "Night shifts here, the bright panel is painful.",
+        ),
+    )
+    .await;
+    let (c1, c2) = (cluster_id(&st, &r1), cluster_id(&st, &r2));
+    assert_ne!(c1, c2);
+    assert_eq!(promote_blocking(&st, c1).await, "CLIP-9");
+    assert_eq!(promote_blocking(&st, c2).await, "CLIP-10");
+
+    let creates = by_path(&m, "POST", "/api/issues");
+    assert_eq!(creates.len(), 2);
+    let (manual_issue, request_issue) = (&creates[0], &creates[1]);
+    assert_eq!(manual_issue.body["labels"], json!(["breadbug", "manual"]));
+    assert_eq!(
+        manual_issue.body["title"],
+        "[breadbug] Panel flickers on workspace switch"
+    );
+    let body = manual_issue.body["body"].as_str().unwrap();
+    for needle in [
+        "user-filed manual bug report",
+        "a manual bug report in `clip`",
+        "Panel flickers on workspace switch",
+        "flickers for a second on every switch",
+    ] {
+        assert!(body.contains(needle), "missing {needle:?} in\n{body}");
+    }
+    assert_eq!(request_issue.body["labels"], json!(["breadbug", "request"]));
+    assert_eq!(
+        request_issue.body["title"],
+        "[breadbug] Dark mode for the panel"
+    );
+    let body = request_issue.body["body"].as_str().unwrap();
+    for needle in [
+        "user-filed feature request",
+        "a feature request in `clip`",
+        "Dark mode for the panel",
+        "dark theme option",
+        "bright panel is painful",
+    ] {
+        assert!(body.contains(needle), "missing {needle:?} in\n{body}");
+    }
+    // Growth and fixed tracking apply to the new kinds too.
+    let cluster = st.db.cluster(c2).unwrap().unwrap();
+    assert_eq!(
+        (cluster.status.as_str(), cluster.issue_key.as_deref()),
+        ("promoted", Some("CLIP-10"))
     );
 }
 

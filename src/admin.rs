@@ -342,8 +342,19 @@ fn sample_html(raw: &str) -> String {
         return "<p class=\"muted\">unreadable report</p>".to_string();
     };
     let mut out = String::new();
+    if let Some(t) = v["title"].as_str().filter(|t| !t.is_empty()) {
+        let _ = write!(out, "<p><b>Title:</b> {}</p>", esc(t));
+    }
+    if let Some(w) = v["want"].as_str().filter(|w| !w.is_empty()) {
+        let _ = write!(out, "<p><b>Wants:</b> {}</p>", esc(w));
+    }
     if let Some(n) = v["notes"].as_str().filter(|n| !n.is_empty()) {
-        let _ = write!(out, "<p><b>Notes:</b> {}</p>", esc(n));
+        let label = if v["report_type"].as_str() == Some("request") {
+            "Why"
+        } else {
+            "Notes"
+        };
+        let _ = write!(out, "<p><b>{label}:</b> {}</p>", esc(n));
     }
     if let Some(m) = v["markers"].as_array().and_then(|m| m.last()) {
         if let Some(msg) = m["message"].as_str() {

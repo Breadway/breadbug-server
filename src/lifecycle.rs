@@ -64,6 +64,32 @@ fn one_line(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// Display name for a cluster kind in filed issues.
+fn kind_name(kind: &str) -> &'static str {
+    match kind {
+        "manual" => "manual bug report",
+        "request" => "feature request",
+        _ => match kind {
+            "crash" => "crash",
+            "freeze" => "freeze",
+            _ => "behavior",
+        },
+    }
+}
+
+/// How a kind was found, for the issue body.
+fn found_by(kind: &str) -> &'static str {
+    match kind {
+        "manual" => {
+            "a user-filed manual bug report (written by the user, scrubbed client-side and server-side)"
+        }
+        "request" => {
+            "a user-filed feature request (written by the user, scrubbed client-side and server-side)"
+        }
+        _ => "opt-in user bug reports (scrubbed client-side and server-side)",
+    }
+}
+
 /// The issue body: how it was found, confidence, and what the bug is.
 pub fn issue_body(c: &ClusterRow, samples: &[String], cluster_url: Option<&str>) -> String {
     let versions = c
@@ -80,11 +106,14 @@ pub fn issue_body(c: &ClusterRow, samples: &[String], cluster_url: Option<&str>)
         .join(", ");
     let mut b = String::new();
     b.push_str("Filed from the breadbug triage inbox.\n\n");
-    b.push_str("**How it was found:** opt-in user bug reports (scrubbed client-side and server-side), grouped by breadbug-server.\n\n");
+    b.push_str(&format!(
+        "**How it was found:** {}, grouped by breadbug-server.\n\n",
+        found_by(&c.kind)
+    ));
     b.push_str(&format!("**Confidence:** {}.\n\n", confidence(c)));
     b.push_str(&format!(
         "**What it is:** a {} in `{}`: {} report(s) from {} install(s), first seen {}, last seen {}.\n\n",
-        c.kind,
+        kind_name(&c.kind),
         c.app,
         c.count,
         c.installs,
@@ -124,6 +153,12 @@ pub fn evidence(raw: &str) -> String {
         return String::new();
     };
     let mut lines: Vec<String> = Vec::new();
+    if let Some(t) = v["title"].as_str().filter(|t| !t.trim().is_empty()) {
+        lines.push(format!("title: {}", one_line(t, 200)));
+    }
+    if let Some(w) = v["want"].as_str().filter(|w| !w.trim().is_empty()) {
+        lines.push(format!("wants: {}", one_line(w, 300)));
+    }
     if let Some(m) = v["markers"].as_array().and_then(|m| m.last()) {
         if let Some(msg) = m["message"].as_str() {
             lines.push(format!(
