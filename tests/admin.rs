@@ -550,7 +550,7 @@ async fn missing_symbols_page_lists_build_ids() {
 }
 
 #[tokio::test]
-async fn inbox_kind_filter_separates_manual_from_crashes() {
+async fn inbox_kind_filter_separates_manual_and_request_from_crashes() {
     let h = harness(true);
     public_post(
         &h,
@@ -569,12 +569,29 @@ async fn inbox_kind_filter_separates_manual_from_crashes() {
         }),
     )
     .await;
+    public_post(
+        &h,
+        &"3".repeat(32),
+        &json!({
+            "schema": 1, "report_type": "request", "created_unix": 1,
+            "app": {"id": "clip", "version": "0.3"},
+            "title": "Dark mode please",
+            "want": "A dark theme for the panel.",
+            "notes": "Working at night with a bright panel hurts my eyes.",
+        }),
+    )
+    .await;
 
     let crashes = admin(&h, get("/admin/?status=all&kind=crash")).await.body;
     assert!(crashes.contains("a crash happened"), "{crashes}");
     assert!(!crashes.contains("Panel flickers on switch"), "{crashes}");
+    assert!(!crashes.contains("Dark mode please"), "{crashes}");
 
     let manual = admin(&h, get("/admin/?status=all&kind=manual")).await.body;
     assert!(manual.contains("Panel flickers on switch"), "{manual}");
     assert!(!manual.contains("a crash happened"), "{manual}");
+
+    let requests = admin(&h, get("/admin/?status=all&kind=request")).await.body;
+    assert!(requests.contains("Dark mode please"), "{requests}");
+    assert!(!requests.contains("a crash happened"), "{requests}");
 }

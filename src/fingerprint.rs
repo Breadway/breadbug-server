@@ -12,7 +12,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::schema::{Frame, Marker, MarkerKind, Report};
+use crate::schema::{Frame, Marker, MarkerKind, Report, ReportType};
 
 /// Bump when normalization changes; fingerprints include it.
 pub const RULES_VERSION: u32 = 2;
@@ -212,6 +212,15 @@ fn problem_marker(report: &Report) -> Option<&Marker> {
 /// (a behavior report, or a freeze with no stack). Those go to the fuzzy
 /// clustering step instead.
 pub fn fingerprint(report: &Report) -> Option<Fingerprint> {
+    // Only automatic crash and freeze reports cluster by fingerprint. A
+    // manual report or feature request may carry incidental panic frames, but
+    // it describes a problem in the user's own words and is grouped by that
+    // text, so it must never be absorbed into a crash cluster (and a crash
+    // must never join a manual or request cluster). Including the kind here
+    // keeps the two spaces apart without a schema change.
+    if !matches!(report.report_type, ReportType::Crash | ReportType::Freeze) {
+        return None;
+    }
     let marker = problem_marker(report);
     let frames: &[Frame] = match marker {
         Some(m) if !m.frames.is_empty() => &m.frames,

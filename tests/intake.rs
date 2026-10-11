@@ -979,6 +979,9 @@ async fn manual_reports_are_covered_by_retention() {
     call(&h, post_as(&"1".repeat(32), &body)).await;
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(maintain(&h.state).unwrap(), 1);
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+}
+
 // ---- feature requests -----------------------------------------------------
 
 fn feature_request(title: &str, want: &str, why: &str) -> Vec<u8> {
@@ -1042,4 +1045,108 @@ async fn feature_requests_need_what_and_why() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
     assert_eq!(h.state.db.report_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn feature_request_resend_delete_and_token_are_safe() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let body = feature_request(
+        "Dark mode for the panel",
+        "A dark theme option for the top panel.",
+        "I work at night and the bright panel hurts.",
+    );
+    let (s1, _, r1) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(s1, StatusCode::CREATED);
+    let receipt = r1["receipt"].as_str().unwrap().to_string();
+    let token = r1["deletion_token"].as_str().unwrap().to_string();
+    // Idempotent resend: same receipt, no second report.
+    let (s2, _, r2) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(r2["receipt"], r1["receipt"]);
+    assert_eq!(h.state.db.report_count().unwrap(), 1);
+    // Delete needs the token; a wrong token leaves the report in place.
+    let del = |tok: &str| {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/reports/{receipt}"))
+            .header("authorization", format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        call(&h, del(&"0".repeat(64))).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.state.db.report_count().unwrap(), 1);
+    assert_eq!(call(&h, del(&token)).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn hostile_text_in_a_request_is_scrubbed_and_quarantined() {
+    let h = harness(|_| {});
+    let body = feature_request(
+        "Breaks for leak@example.org",
+        "Email leak@example.org when it happens.",
+        "Reach me at leak@example.org about it.",
+    );
+    let (status, _, r) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let receipt = r["receipt"].as_str().unwrap();
+    let raw = h.state.db.raw_of(receipt).unwrap().unwrap();
+    assert!(!raw.contains("leak@example.org"));
+    assert_eq!(h.state.db.is_quarantined(receipt).unwrap(), Some(true));
+}
+
+#[tokio::test]
+async fn manual_and_request_reports_never_join_a_crash_cluster() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    // An automatic crash with panic frames.
+    let crash_body = crash("0.3.1", "clip::draw", "boom at the panel", "os-1");
+    let (_, _, cr) = call(&h, post_as(&"1".repeat(32), &crash_body)).await;
+    let crash_cluster = h
+        .state
+        .db
+        .cluster_of(cr["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.state.db.cluster(crash_cluster).unwrap().unwrap().kind,
+        "crash"
+    );
+
+    // The very same panic frames, but filed by hand and as a request.
+    let mut manual: Value = serde_json::from_slice(&crash_body).unwrap();
+    manual["report_type"] = json!("manual");
+    manual["title"] = json!("The panel dies when I open settings");
+    manual["notes"] = json!("Opening settings today closes the whole top panel instantly.");
+    let manual = serde_json::to_vec(&manual).unwrap();
+    let mut request: Value = serde_json::from_slice(&crash_body).unwrap();
+    request["report_type"] = json!("request");
+    request["title"] = json!("Stop the panel closing");
+    request["want"] = json!("The panel should stay open when I open settings.");
+    request["notes"] = json!("It closes the shell when I open settings, please change that.");
+    let request = serde_json::to_vec(&request).unwrap();
+
+    let (_, _, mr) = call(&h, post_as(&"2".repeat(32), &manual)).await;
+    let (_, _, rr) = call(&h, post_as(&"3".repeat(32), &request)).await;
+    let m_cluster = h
+        .state
+        .db
+        .cluster_of(mr["receipt"].as_str().unwrap())
+        .unwrap();
+    let r_cluster = h
+        .state
+        .db
+        .cluster_of(rr["receipt"].as_str().unwrap())
+        .unwrap();
+    assert_ne!(m_cluster, Some(crash_cluster));
+    assert_ne!(r_cluster, Some(crash_cluster));
+    // And the crash cluster keeps only the automatic report.
+    assert_eq!(h.state.db.cluster(crash_cluster).unwrap().unwrap().count, 1);
+    for (id, kind) in [(m_cluster, "manual"), (r_cluster, "request")] {
+        if let Some(id) = id {
+            assert_eq!(h.state.db.cluster(id).unwrap().unwrap().kind, kind);
+        }
+    }
 }
