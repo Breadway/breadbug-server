@@ -50,6 +50,8 @@ pub struct PublicStatus {
     /// | issue `backlog` or `todo` | `accepted` |
     /// | issue `doing` | `in_development` |
     pub progress: Option<String>,
+    /// Planned vs confirmed beta and stable application releases, if any.
+    pub releases: Option<ReleaseTrack>,
 }
 
 /// Development progress for a cluster row. See [`PublicStatus::progress`]
@@ -88,6 +90,47 @@ pub fn progress_of(c: &ClusterRow) -> Option<&'static str> {
     }
     None
 }
+
+/// One release channel (beta or stable): what release is planned and whether
+/// it has actually shipped. Per application release, never per BOS
+/// distribution release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRelease {
+    pub planned: Option<String>,
+    pub shipped: bool,
+    pub shipped_in: Option<String>,
+}
+
+/// Planned vs confirmed availability for both channels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseTrack {
+    pub beta: ChannelRelease,
+    pub stable: ChannelRelease,
+}
+
+/// Release tracking for a cluster row, or `None` when nothing is planned
+/// or confirmed yet.
+pub fn releases_of(c: &ClusterRow) -> Option<ReleaseTrack> {
+    if c.target_beta.is_none()
+        && c.confirmed_beta.is_none()
+        && c.target_stable.is_none()
+        && c.confirmed_stable.is_none()
+    {
+        return None;
+    }
+    let channel = |planned: &Option<String>, confirmed: &Option<String>| ChannelRelease {
+        planned: planned.clone(),
+        shipped: confirmed.is_some(),
+        shipped_in: confirmed.clone(),
+    };
+    Some(ReleaseTrack {
+        beta: channel(&c.target_beta, &c.confirmed_beta),
+        stable: channel(&c.target_stable, &c.confirmed_stable),
+    })
+}
+
+/// Longest version string the release columns accept.
+pub const MAX_VERSION: usize = 128;
 
 /// A report shown as evidence in the triage view.
 #[derive(Debug, Clone)]
@@ -166,6 +209,10 @@ pub struct ClusterRow {
     /// Whether the fixed state came from the board reaching `done` (so a
     /// board reopen should re-derive it), as opposed to an admin mark-fixed.
     pub board_fixed: bool,
+    pub target_beta: Option<String>,
+    pub confirmed_beta: Option<String>,
+    pub target_stable: Option<String>,
+    pub confirmed_stable: Option<String>,
     pub merged_into: Option<i64>,
 }
 
@@ -283,6 +330,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE clusters ADD COLUMN board_fixed INTEGER NOT NULL DEFAULT 0;",
     // 10: cached breadboard issue status for the public progress stage
     "ALTER TABLE clusters ADD COLUMN issue_status TEXT;",
+    // 11: per-app beta/stable release tracking: planned vs confirmed
+    "ALTER TABLE clusters ADD COLUMN target_beta TEXT;
+    ALTER TABLE clusters ADD COLUMN confirmed_beta TEXT;
+    ALTER TABLE clusters ADD COLUMN target_stable TEXT;
+    ALTER TABLE clusters ADD COLUMN confirmed_stable TEXT;",
 ];
 
 impl Db {
@@ -568,6 +620,7 @@ impl Db {
             status: "received",
             fixed_in: None,
             progress: None,
+            releases: None,
         };
         let (Some(cid), 0) = (cluster, quarantined) else {
             return Ok(Some(received));
@@ -577,32 +630,38 @@ impl Db {
             return Ok(Some(received));
         };
         let progress = progress_of(&c).map(str::to_string);
+        let releases = releases_of(&c);
         Ok(Some(match c.status.as_str() {
             "promoted" | "investigating" | "regressed" => PublicStatus {
                 status: "investigating",
                 fixed_in: None,
                 progress,
+                releases,
             },
             "fixed" => PublicStatus {
                 status: "fixed",
                 fixed_in: c.fixed_in,
                 progress,
+                releases,
             },
             "dismissed" => PublicStatus {
                 status: "closed",
                 fixed_in: None,
                 progress,
+                releases,
             },
             "deferred" => PublicStatus {
                 status: "investigating",
                 fixed_in: None,
                 progress,
+                releases,
             },
             // A known problem others have already reported.
             _ if c.count > 1 => PublicStatus {
                 status: "duplicate",
                 fixed_in: None,
                 progress,
+                releases,
             },
             _ => received,
         }))
@@ -797,6 +856,86 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
         Ok(self.conn().execute(
             "UPDATE clusters SET issue_status = ?2 WHERE id = ?1 AND merged_into IS NULL",
             params![id, status],
+        )? > 0)
+    }
+
+    fn release_targets(&self, id: i64) -> Result<Option<(Option<String>, Option<String>)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT target_beta, target_stable FROM clusters WHERE id = ?1 AND merged_into IS NULL",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn valid_version(version: &str) -> bool {
+        !version.is_empty() && version.len() <= MAX_VERSION
+    }
+
+    /// Plan the fix or feature for a beta or stable application release.
+    /// The beta target must not be newer than the stable target. Returns
+    /// false for a bad channel, a bad version, bad ordering, or no cluster.
+    pub fn set_release_target(&self, id: i64, channel: &str, version: &str) -> Result<bool> {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+            return Ok(false);
+        }
+        let Some((beta, stable)) = self.release_targets(id)? else {
+            return Ok(false);
+        };
+        let (beta, stable) = match channel {
+            "beta" => (Some(version.to_string()), stable),
+            _ => (beta, Some(version.to_string())),
+        };
+        if let (Some(b), Some(s)) = (&beta, &stable) {
+            if crate::lifecycle::version_cmp(b, s) == std::cmp::Ordering::Greater {
+                return Ok(false);
+            }
+        }
+        let column = if channel == "beta" {
+            "target_beta"
+        } else {
+            "target_stable"
+        };
+        Ok(self.conn().execute(
+            &format!("UPDATE clusters SET {column} = ?2 WHERE id = ?1 AND merged_into IS NULL"),
+            params![id, version],
+        )? > 0)
+    }
+
+    /// Confirm the fix or feature actually shipped in a channel release.
+    /// The channel must have a planned target first. Returns false
+    /// otherwise, or for a bad channel, version, or cluster.
+    pub fn mark_release_confirmed(&self, id: i64, channel: &str, version: &str) -> Result<bool> {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+            return Ok(false);
+        }
+        let column = if channel == "beta" {
+            ("confirmed_beta", "target_beta")
+        } else {
+            ("confirmed_stable", "target_stable")
+        };
+        let planned: Option<Option<String>> = self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {} FROM clusters WHERE id = ?1 AND merged_into IS NULL",
+                    column.1
+                ),
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if !matches!(planned, Some(Some(_))) {
+            return Ok(false);
+        }
+        Ok(self.conn().execute(
+            &format!(
+                "UPDATE clusters SET {} = ?2 WHERE id = ?1 AND merged_into IS NULL",
+                column.0
+            ),
+            params![id, version],
         )? > 0)
     }
 
@@ -1175,7 +1314,8 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             .query_row(
                 "SELECT c.id, c.app, c.kind, c.fingerprint, c.title, c.status, c.first_seen,
                         c.last_seen, c.count, c.versions, c.os_builds, c.fixed_in, c.issue_key,
-                        c.issue_status, c.board_fixed, c.merged_into,
+c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
+                        c.target_stable, c.confirmed_stable, c.merged_into,
                         (SELECT count(*) FROM cluster_installs i WHERE i.cluster_id = c.id)
                  FROM clusters c WHERE c.id = ?1",
                 params![id],
@@ -1198,8 +1338,12 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
                         issue_key: r.get(12)?,
                         issue_status: r.get(13)?,
                         board_fixed: r.get(14)?,
-                        merged_into: r.get(15)?,
-                        installs: r.get::<_, i64>(16)? as u64,
+                        target_beta: r.get(15)?,
+                        confirmed_beta: r.get(16)?,
+                        target_stable: r.get(17)?,
+                        confirmed_stable: r.get(18)?,
+                        merged_into: r.get(19)?,
+                        installs: r.get::<_, i64>(20)? as u64,
                     })
                 },
             )
