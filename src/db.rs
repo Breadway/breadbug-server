@@ -1722,26 +1722,44 @@ c.issue_status, c.board_fixed, c.target_beta, c.confirmed_beta,
         text: &str,
         at: u64,
     ) -> Result<bool> {
-        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_release_version(version) {
             return Ok(false);
         }
-        let (column, target) = if channel == "beta" {
-            ("confirmed_beta", "target_beta")
-        } else {
-            ("confirmed_stable", "target_stable")
-        };
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let planned: Option<Option<String>> = tx
-            .query_row(
-                &format!("SELECT {target} FROM clusters WHERE id = ?1 AND merged_into IS NULL"),
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if !matches!(planned, Some(Some(_))) {
+        let Some(state) = Self::release_state(&conn, id)? else {
+            return Ok(false);
+        };
+        let planned = if channel == "beta" {
+            &state.target_beta
+        } else {
+            &state.target_stable
+        };
+        if planned.is_none() {
             return Ok(false);
         }
+        let (eff_beta, eff_stable) = if channel == "beta" {
+            (
+                Some(version.to_string()),
+                state
+                    .confirmed_stable
+                    .clone()
+                    .or(state.target_stable.clone()),
+            )
+        } else {
+            (
+                state.confirmed_beta.clone().or(state.target_beta.clone()),
+                Some(version.to_string()),
+            )
+        };
+        if !Self::ordering_ok(&eff_beta, &eff_stable) {
+            return Ok(false);
+        }
+        let column = if channel == "beta" {
+            "confirmed_beta"
+        } else {
+            "confirmed_stable"
+        };
         let changed = tx.execute(
             &format!("UPDATE clusters SET {column} = ?2 WHERE id = ?1 AND merged_into IS NULL"),
             params![id, version],

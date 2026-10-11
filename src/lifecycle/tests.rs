@@ -103,6 +103,7 @@ fn notice_text_names_app_version_and_stage_per_kind() {
         fixed_in: None,
         issue_key: None,
         issue_status: None,
+        board_fixed: false,
         target_beta: None,
         confirmed_beta: None,
         target_stable: None,
