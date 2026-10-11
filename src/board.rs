@@ -182,8 +182,10 @@ impl BoardClient {
     }
 
     /// The issue's workflow status plus the fix version the board records,
-    /// if any. The version is read from a `fix_version` field, accepted at
-    /// the top level of the reply or under `issue`.
+    /// if any. The version is read from a `fixed-in:<version>` label (the
+    /// convention documented in README.md), or from a `fix_version` field at
+    /// the top level of the reply or under `issue` if the board ever gains
+    /// one.
     pub fn issue_state(&self, key: &str) -> Result<IssueState> {
         let v = self.call("GET", &format!("/issues/{}", safe_key(key)?), None)?;
         let status = v["status"]
@@ -194,14 +196,30 @@ impl BoardClient {
         let fix_version = v["fix_version"]
             .as_str()
             .or_else(|| v["issue"]["fix_version"].as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && s.len() <= 128)
-            .map(String::from);
+            .and_then(normalize_version)
+            .or_else(|| label_fix_version(&v));
         Ok(IssueState {
             status,
             fix_version,
         })
     }
+}
+
+fn normalize_version(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty() && s.len() <= 128).then(|| s.to_string())
+}
+
+/// The shipped version the board records for an issue, read from a
+/// `fixed-in:<version>` label. The first match wins.
+fn label_fix_version(v: &Value) -> Option<String> {
+    let labels = v["labels"]
+        .as_array()
+        .or_else(|| v["issue"]["labels"].as_array())?;
+    labels.iter().find_map(|l| {
+        let name = l.as_str().or_else(|| l["name"].as_str())?;
+        name.strip_prefix("fixed-in:").and_then(normalize_version)
+    })
 }
 
 /// The workflow status plus the recorded fix version for one board issue.

@@ -98,7 +98,8 @@ fn mock_board() -> Mock {
                 ("GET", p) if p.starts_with("/api/issues/") => {
                     let mut v = json!({"status": st2.lock().unwrap().clone()});
                     if let Some(fv) = fv2.lock().unwrap().clone() {
-                        v["fix_version"] = json!(fv);
+                        // The board records the shipped version as a label.
+                        v["labels"] = json!([format!("fixed-in:{fv}")]);
                     }
                     (200, v)
                 }
