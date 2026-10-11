@@ -79,7 +79,7 @@ async fn submit(h: &Harness, install: &str, body: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn follow_returns_a_token_and_a_resubscribe_is_a_duplicate() {
+async fn follow_returns_a_token_and_a_retry_rotates_it() {
     let h = harness(|_| {});
     let receipt = submit(&h, INSTALL_A, &with_notes("follow this problem")).await;
     let (status, body) = call(&h, follow(&receipt, Some(INSTALL_A))).await;
@@ -95,9 +95,14 @@ async fn follow_returns_a_token_and_a_resubscribe_is_a_duplicate() {
 
     let (status, again) = call(&h, follow(&receipt, Some(INSTALL_A))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(again["duplicate"], json!(true));
-    assert!(again.get("follow_token").is_none());
+    // The retry rotates the capability and returns a usable token, so a
+    // client that lost the first response can recover.
+    let token2 = again["follow_token"].as_str().unwrap().to_string();
+    assert_eq!(token2.len(), 64);
+    assert_ne!(token2, token);
     assert_eq!(h.state.db.follow_count(cluster).unwrap(), 1);
+    assert_eq!(call(&h, unfollow(&token)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(call(&h, unfollow(&token2)).await.0, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -204,7 +209,8 @@ async fn merging_clusters_folds_follows_into_the_target() {
     assert_ne!(c1, c2);
 
     // Both installs follow both clusters: 2 follows each.
-    call(&h, follow(&r1, Some(INSTALL_A))).await;
+    let (_, b1) = call(&h, follow(&r1, Some(INSTALL_A))).await;
+    let alias_a = b1["follow_token"].as_str().unwrap().to_string();
     let (_, b2) = call(&h, follow(&r2, Some(INSTALL_A))).await;
     let survivor = b2["follow_token"].as_str().unwrap().to_string();
     call(&h, follow(&r1, Some(INSTALL_B))).await;
@@ -213,17 +219,79 @@ async fn merging_clusters_folds_follows_into_the_target() {
     assert_eq!(h.state.db.follow_count(c2).unwrap(), 2);
 
     assert!(h.state.db.merge_clusters(c1, c2).unwrap());
-    // The duplicate install rows fold: the target has 2 follows, not 4.
+    // Distinct installs fold: the target reports 2 installs, not 4, and the
+    // source is empty.
     assert_eq!(h.state.db.follow_count(c2).unwrap(), 2);
     assert_eq!(h.state.db.follow_count(c1).unwrap(), 0);
-    // Following through the merged-away receipt is a duplicate on the target.
-    let (status, again) = call(&h, follow(&r1, Some(INSTALL_A))).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(again["duplicate"], json!(true));
-    // The surviving target token still unsubscribes.
+    // Install A followed both clusters, so both of its capability tokens stay
+    // valid as aliases on the target instead of one silently dying.
+    assert_eq!(call(&h, unfollow(&alias_a)).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(h.state.db.follow_count(c2).unwrap(), 2);
     assert_eq!(
         call(&h, unfollow(&survivor)).await.0,
         StatusCode::NO_CONTENT
     );
     assert_eq!(h.state.db.follow_count(c2).unwrap(), 1);
+    // Following through the merged-away receipt now acts on the target.
+    let (status, again) = call(&h, follow(&r1, Some(INSTALL_A))).await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "{status}"
+    );
+    assert!(again["follow_token"].is_string());
+}
+
+#[tokio::test]
+async fn reporter_follows_with_the_deletion_token() {
+    let h = harness(|_| {});
+    let body = with_notes("reporter follow note");
+    let (_, resp) = call(&h, post_report(&body, INSTALL_A)).await;
+    let receipt = resp["receipt"].as_str().unwrap().to_string();
+    let deletion = resp["deletion_token"].as_str().unwrap().to_string();
+
+    // No install header: the deletion token authenticates the reporter.
+    let reporter = |token: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/reports/{receipt}/follow"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, b) = call(&h, reporter(&deletion)).await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    assert!(b["follow_token"].is_string());
+    let cluster = h.state.db.cluster_of(&receipt).unwrap().unwrap();
+    assert_eq!(h.state.db.follow_count(cluster).unwrap(), 1);
+
+    // A wrong deletion token with no install is refused, not treated as a
+    // non-reporter follow.
+    assert_eq!(
+        call(&h, reporter(&"0".repeat(64))).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // A wrong deletion token plus a valid install falls back to the install
+    // flow (a separate subscriber), which is allowed.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/reports/{receipt}/follow"))
+        .header("authorization", format!("Bearer {}", "0".repeat(64)))
+        .header("x-breadbug-install", INSTALL_B)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(call(&h, req).await.0, StatusCode::CREATED);
+    assert_eq!(h.state.db.follow_count(cluster).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn a_lost_follow_response_can_be_recovered() {
+    let h = harness(|_| {});
+    let receipt = submit(&h, INSTALL_A, &with_notes("lost response note")).await;
+    // First follow, whose response is (say) lost before the client sees it.
+    let (_, _first) = call(&h, follow(&receipt, Some(INSTALL_A))).await;
+    // Retry: a usable token comes back.
+    let (status, retry) = call(&h, follow(&receipt, Some(INSTALL_A))).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = retry["follow_token"].as_str().unwrap().to_string();
+    assert_eq!(call(&h, unfollow(&token)).await.0, StatusCode::NO_CONTENT);
 }

@@ -454,10 +454,12 @@ async fn report_status(
     }
 }
 
-/// Follow the cluster behind a report: anonymous, no account. The receipt is
-/// the capability that names the issue; anyone holding it may follow. Returns
-/// a follow token that later unsubscribes. Nothing about other followers is
-/// revealed.
+/// Follow the cluster behind a report: no account. Two authorized flows:
+/// the reporter proves themselves with the report's deletion token in the
+/// Authorization header, while any other subscriber proves themselves with
+/// their install id. A fresh token is returned either way, replacing an
+/// earlier one for the same caller so a lost response can be recovered.
+/// Nothing about other followers is revealed.
 async fn follow_report(
     State(s): State<Arc<AppState>>,
     Path(receipt): Path<String>,
@@ -466,27 +468,66 @@ async fn follow_report(
     if !valid_receipt(&receipt) {
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    let Some(install) = headers
-        .get("x-breadbug-install")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| valid_install_id(v))
-    else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "missing or invalid X-Breadbug-Install",
-        );
-    };
     if let Err(wait) = s
         .per_network
         .check(network_key(&s, &headers), Instant::now())
     {
         return too_many(wait);
     }
-    let install_hash = hmac_hex(
-        &s.secret,
-        "install",
-        install.to_ascii_lowercase().as_bytes(),
-    );
+    let reporter_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string);
+    let install = headers
+        .get("x-breadbug-install")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| valid_install_id(v))
+        .map(str::to_string);
+    if reporter_token.is_none() && install.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "provide X-Breadbug-Install or the reporter deletion token",
+        );
+    }
+    let install_hash = match reporter_token.as_deref() {
+        Some(tok) => {
+            let db = s.db.clone();
+            let receipt_c = receipt.clone();
+            let token_hash = sha256_hex(tok.as_bytes());
+            match tokio::task::spawn_blocking(move || {
+                db.deletion_token_matches(&receipt_c, &token_hash)
+            })
+            .await
+            {
+                Ok(Ok(true)) => hmac_hex(&s.secret, "reporter", receipt.as_bytes()),
+                // A wrong deletion token may still be a plain subscriber.
+                Ok(Ok(false)) => match install.as_deref() {
+                    Some(inst) => {
+                        hmac_hex(&s.secret, "install", inst.to_ascii_lowercase().as_bytes())
+                    }
+                    None => {
+                        return err(
+                            StatusCode::FORBIDDEN,
+                            "the deletion token does not match this report",
+                        )
+                    }
+                },
+                _ => {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not check the request",
+                    )
+                }
+            }
+        }
+        None => {
+            let inst = install.as_deref().unwrap_or_default();
+            hmac_hex(&s.secret, "install", inst.to_ascii_lowercase().as_bytes())
+        }
+    };
     {
         let db = s.db.clone();
         let hash = install_hash.clone();
@@ -522,24 +563,26 @@ async fn follow_report(
             }
         }
         let token = random_hex(32);
-        let added = db.follow(
+        let replaced = db.follow(
             target,
             &sha256_hex(token.as_bytes()),
             &install_hash,
             now_unix(),
         )?;
-        anyhow::Ok(Ok((added, token)))
+        anyhow::Ok(Ok((replaced, token)))
     })
     .await;
     match outcome {
-        Ok(Ok(Ok((true, token)))) => (
-            StatusCode::CREATED,
+        // A fresh follow is 201; a retry that rotates the token is 200. Both
+        // return a usable token, so a client that lost the first response can
+        // recover by retrying.
+        Ok(Ok(Ok((replaced, token)))) => (
+            if replaced {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
             Json(json!({ "follow_token": token, "status": "following" })),
-        )
-            .into_response(),
-        Ok(Ok(Ok((false, _)))) => (
-            StatusCode::OK,
-            Json(json!({ "status": "following", "duplicate": true })),
         )
             .into_response(),
         Ok(Ok(Err(true))) => err(StatusCode::CONFLICT, "report is not grouped yet"),

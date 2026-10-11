@@ -213,6 +213,10 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX follows_cluster ON follows(cluster_id);
     CREATE UNIQUE INDEX follows_one_per_install ON follows(cluster_id, install_hash);",
+    // 8: follow capability aliases: a merge can fold two follows into one
+    // cluster and both tokens must keep working, so more than one live token
+    // per install is allowed. Idempotency is handled by rotating in `follow`.
+    "DROP INDEX IF EXISTS follows_one_per_install;",
 ];
 
 impl Db {
@@ -766,14 +770,10 @@ impl Db {
             "UPDATE reports SET cluster_id = ?2 WHERE cluster_id = ?1",
             params![from, into],
         )?;
-        // Follows move with the reports. An install following both keeps its
-        // target follow; the duplicate source row goes away (that token stops
-        // working, the install is still subscribed through the surviving one).
-        tx.execute(
-            "DELETE FROM follows WHERE cluster_id = ?1 AND install_hash IN
-             (SELECT install_hash FROM follows WHERE cluster_id = ?2)",
-            params![from, into],
-        )?;
+        // Follows move with the reports. An install following both clusters
+        // keeps both capability tokens (aliases): each one still reads and
+        // unsubscribes the folded follow instead of the source token being
+        // silently invalidated.
         tx.execute(
             "UPDATE follows SET cluster_id = ?2 WHERE cluster_id = ?1",
             params![from, into],
@@ -1123,8 +1123,10 @@ impl Db {
             .flatten())
     }
 
-    /// Follow a cluster. Returns false when this install already follows it
-    /// (the first follow token keeps working, no second one is issued).
+    /// Follow a cluster. A fresh token replaces any earlier one for the same
+    /// install on this cluster, so a lost first response can be recovered by
+    /// retrying (the retry returns a usable token). Returns whether an
+    /// earlier follow was replaced.
     pub fn follow(
         &self,
         cluster_id: i64,
@@ -1132,11 +1134,19 @@ impl Db {
         install_hash: &str,
         at: u64,
     ) -> Result<bool> {
-        Ok(self.conn().execute(
-            "INSERT OR IGNORE INTO follows (cluster_id, token_hash, install_hash, created_at)
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let replaced = tx.execute(
+            "DELETE FROM follows WHERE cluster_id = ?1 AND install_hash = ?2",
+            params![cluster_id, install_hash],
+        )? > 0;
+        tx.execute(
+            "INSERT INTO follows (cluster_id, token_hash, install_hash, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![cluster_id, token_hash, install_hash, at as i64],
-        )? > 0)
+        )?;
+        tx.commit()?;
+        Ok(replaced)
     }
 
     /// Stop following. Returns false for an unknown token.
@@ -1147,13 +1157,28 @@ impl Db {
         )? > 0)
     }
 
-    /// How many installs follow a cluster.
+    /// How many installs follow a cluster (a merge can leave an install with
+    /// more than one live token, so count distinct installs).
     pub fn follow_count(&self, cluster_id: i64) -> Result<usize> {
         Ok(self.conn().query_row(
-            "SELECT count(*) FROM follows WHERE cluster_id = ?1",
+            "SELECT count(DISTINCT install_hash) FROM follows WHERE cluster_id = ?1",
             params![cluster_id],
             |r| r.get::<_, i64>(0),
         )? as usize)
+    }
+
+    /// Whether `token_hash` is the deletion token of the report with this
+    /// receipt. Used to authenticate the reporter for follow.
+    pub fn deletion_token_matches(&self, receipt: &str, token_hash: &str) -> Result<bool> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT token_hash FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored.is_some_and(|s| ct_eq(&s, token_hash)))
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really
