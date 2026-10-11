@@ -57,12 +57,7 @@ fn centroid_and_byte_roundtrip() {
 
 #[test]
 fn http_embedder_only_talks_to_local_addresses() {
-    for ok in [
-        "http://127.0.0.1:8080/embed",
-        "http://localhost/embed",
-        "http://192.168.1.5:80/e",
-        "http://host.docker.internal:9/e",
-    ] {
+    for ok in ["http://127.0.0.1:8080/embed", "http://[::1]:8080/embed"] {
         assert!(HttpEmbedder::new(ok, "m").is_ok(), "{ok}");
     }
     for bad in [
@@ -70,6 +65,15 @@ fn http_embedder_only_talks_to_local_addresses() {
         "http://example.com/embed",
         "ftp://127.0.0.1/x",
         "http://8.8.8.8/embed",
+        "http://localhost/embed",
+        "http://10.example.org/embed",
+        "http://192.168.example.org/embed",
+        "http://127.0.0.1.example.org/embed",
+        "http://192.168.1.5:80/e",
+        "http://host.docker.internal:9/e",
+        "http://127.0.0.1@example.org/embed",
+        "http://user@127.0.0.1/embed",
+        "http://[::ffff:192.168.1.5]/embed",
     ] {
         assert!(HttpEmbedder::new(bad, "m").is_err(), "{bad}");
     }

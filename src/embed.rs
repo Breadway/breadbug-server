@@ -105,7 +105,7 @@ impl Embedder for HashEmbedder {
 }
 
 /// Calls a local embedding service: `POST {url}` with `{"inputs": [text]}`,
-/// expecting `[[f32, ...]]`. Only loopback and private-range hosts are
+/// expecting `[[f32, ...]]`. Only literal loopback IP addresses are
 /// accepted; report text must not leave the machine.
 pub struct HttpEmbedder {
     url: String,
@@ -114,16 +114,18 @@ pub struct HttpEmbedder {
 }
 
 fn local_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or("");
-    host == "localhost"
-        || host == "127.0.0.1"
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("172.16.")
-        || host == "host.docker.internal"
+    parsed.scheme() == "http"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.fragment().is_none()
+        && match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
 }
 
 impl HttpEmbedder {
@@ -137,6 +139,7 @@ impl HttpEmbedder {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
                 .redirects(0)
+                .try_proxy_from_env(false)
                 .build(),
         })
     }

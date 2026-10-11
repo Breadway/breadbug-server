@@ -14,6 +14,7 @@ name = "breadbug-server"
 path = "src/main.rs"
 
 [dependencies]
+url = "2"
 addr2line = "0.25"
 anyhow = "1"
 axum = "0.8"
