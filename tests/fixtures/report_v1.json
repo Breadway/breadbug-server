@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "report_type": "crash",
+  "created_unix": 1791510387,
+  "app": {
+    "id": "clip",
+    "version": "0.3.1",
+    "build_id": "3f2a9c1de4b5a6978081726354453423a1b2c3d4"
+  },
+  "system": {
+    "os_id": "bos",
+    "os_version": null,
+    "os_build": "rolling",
+    "kernel": "6.18.54-2-lts",
+    "arch": "x86_64",
+    "gpu_drivers": [
+      "amdgpu (1002:1114)"
+    ],
+    "compositor": null,
+    "bakery_track": null,
+    "breadd_version": null,
+    "api_version": null
+  },
+  "installed_apps": [],
+  "runtime": {
+    "daemon_running": false,
+    "uptime_s": null,
+    "adapters": {},
+    "modules_total": null,
+    "modules_with_errors": null
+  },
+  "markers": [
+    {
+      "t": 1010,
+      "kind": "panic",
+      "app_version": "0.3.1",
+      "build_id": "3f2a9c1de4b5a6978081726354453423a1b2c3d4",
+      "message": "called `Option::unwrap()` on a `None` value",
+      "location": "<HOME>/Projects/breadclip/src/main.rs:42:13",
+      "frames": [
+        {
+          "module": "breadclip",
+          "offset": 4660,
+          "build_id": "3f2a9c1de4b5a6978081726354453423a1b2c3d4"
+        },
+        {
+          "symbol": "core::panicking::panic"
+        }
+      ]
+    }
+  ],
+  "logs": [
+    {
+      "t": 1000,
+      "level": "INFO",
+      "msg": "clipboard watcher started"
+    },
+    {
+      "t": 1005,
+      "level": "WARN",
+      "msg": "sync failed for <EMAIL:1> from <IP:1>"
+    }
+  ],
+  "daemon_logs": [],
+  "events": [
+    {
+      "t": 1001,
+      "name": "bread.clip.copied",
+      "data": {
+        "_dropped": true,
+        "_keys": [
+          "kind",
+          "len"
+        ]
+      }
+    }
+  ],
+  "journal": [
+    "breadclipd: started (pid 2716)",
+    "breadclipd: wl-paste --watch (exit status: 1), restarting (attempt 1)",
+    "breadclipd: started (pid 2601)",
+    "breadclipd: wl-paste --watch (exit status: 1), restarting (attempt 1)",
+    "breadclipd: started (pid 3002)",
+    "breadclipd: wl-paste --watch (exit status: 1), restarting (attempt 1)",
+    "breadclipd: started (pid 3347)",
+    "breadclipd: cleared history via bread.command.clip.clear",
+    "breadclipd: started (pid 3129)"
+  ],
+  "live_stack": [],
+  "notes": "crashed right after copying a long url",
+  "redactions": {}
+}

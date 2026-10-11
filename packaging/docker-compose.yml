@@ -1,0 +1,48 @@
+# breadbug-server on Hestia.
+#
+# Isolation is deliberate: its own network, its own volume, no mounts from
+# the host, no shared credentials, non-root, read-only root filesystem and no
+# capabilities. A compromise of this container must reach nothing else.
+#
+# Only the public intake port is published for Aegis (over Tailscale). The
+# admin port is bound to loopback on the host and is never routed publicly.
+services:
+  breadbug-server:
+    image: breadbug-server:local
+    build:
+      context: ..
+    container_name: breadbug-server
+    restart: unless-stopped
+    ports:
+      - "8120:8120"
+      - "127.0.0.1:8121:8121"
+    environment:
+      BREADBUG_TRUST_PROXY: "1"
+      BREADBUG_RETENTION_DAYS: "90"
+      # sha256 of the admin bearer token; unset disables the admin UI
+      BREADBUG_ADMIN_TOKEN_SHA256: "${BREADBUG_ADMIN_TOKEN_SHA256:-}"
+    volumes:
+      - breadbug-data:/data
+    networks:
+      - breadbug
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  breadbug-data:
+
+networks:
+  breadbug:
+    driver: bridge

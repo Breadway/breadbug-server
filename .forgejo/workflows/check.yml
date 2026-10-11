@@ -1,0 +1,26 @@
+name: check
+
+# Lint and test on work branches and on main.
+on:
+  push:
+    branches: ['feature/**', 'fix/**', 'main']
+
+jobs:
+  check:
+    runs-on: [self-hosted, hestia]
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          rm -rf src && mkdir src
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
+
+      - name: clippy
+        run: cd src && cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cd src && cargo test --locked
+
+      - name: backup privacy
+        run: cd src && python3 -m unittest discover -s packaging -p 'test_*.py'
