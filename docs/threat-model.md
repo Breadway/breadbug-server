@@ -16,7 +16,7 @@ byte as hostile. This is what the server defends against and how.
 | Prompt injection into an LLM step | Report text is data, never instructions; any LLM output is advisory, off by default, and has no tools |
 | Enumeration of other people's reports | Receipts and deletion tokens are 128 and 256 bits of randomness; a wrong token and an unknown receipt are indistinguishable (404); the status endpoint returns a coarse state only |
 | Follow token probing | Follow and unfollow tokens are 256 bits; unknown tokens are 404 without saying why; follow responses never name other followers |
-| Notification pile-up | Notices are one row per follow per transition text, delivered rows are kept for dedup, reads mark delivered; unfollowing discards pending notices |
+| Notification pile-up | Notices are one row per follow per transition text; reads are a non-destructive peek and the client acks ids, delivered rows are kept for dedup, unfollowing discards pending notices |
 | Replay / duplicates | An identical payload from the same install returns the original receipt |
 | Re-identification via free text | Notes and logs are scrubbed client- and server-side; raw reports are deleted after 90 days (cluster metadata is kept) and on request |
 | Container compromise | Own network and volume, non-root, read-only rootfs, no capabilities, no host mounts, no shared credentials |
