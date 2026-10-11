@@ -89,6 +89,7 @@ fn row() -> ClusterRow {
         fixed_in: None,
         issue_key: None,
         issue_status: None,
+        board_fixed: false,
         merged_into: None,
     }
 }

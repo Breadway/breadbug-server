@@ -752,6 +752,7 @@ async fn an_admin_fixed_cluster_is_not_reopened_by_the_board() {
     let c = st.db.cluster(id).unwrap().unwrap();
     assert_eq!(c.status, "fixed");
     assert!(!c.board_fixed);
+}
 
 #[tokio::test]
 async fn board_reopen_follows_for_manual_and_request_clusters() {
