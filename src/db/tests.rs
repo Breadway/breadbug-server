@@ -233,3 +233,38 @@ fn release_targets_confirm_flow_and_ordering() {
     assert!(track.stable.shipped);
     assert_eq!(track.stable.shipped_in.as_deref(), Some("1.4"));
 }
+
+#[test]
+fn release_confirmation_validates_versions_and_ordering() {
+    let (db, id) = release_cluster();
+    assert!(db.set_release_target(id, "beta", "1.4").unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+    // A confirmed beta newer than the planned stable is refused.
+    assert!(!db.mark_release_confirmed(id, "beta", "9.0").unwrap());
+    // A confirmed stable older than the planned beta is refused.
+    assert!(!db.mark_release_confirmed(id, "stable", "1.0").unwrap());
+    // Malformed versions are refused on both paths.
+    assert!(!db
+        .mark_release_confirmed(id, "beta", "not a version")
+        .unwrap());
+    assert!(!db
+        .mark_release_confirmed(id, "beta", "**1.4**\ninjected")
+        .unwrap());
+    assert!(!db.set_release_target(id, "stable", "1.4 marked").unwrap());
+    // Confirming inside the plan is accepted.
+    assert!(db.mark_release_confirmed(id, "beta", "1.4-beta2").unwrap());
+    // A planned stable below the confirmed beta is refused.
+    assert!(!db.set_release_target(id, "stable", "1.0").unwrap());
+    // A higher beta plan is fine: the confirmed beta dominates the check.
+    assert!(db.set_release_target(id, "beta", "1.5").unwrap());
+    assert!(db.mark_release_confirmed(id, "stable", "1.4").unwrap());
+}
+
+#[test]
+fn release_targets_reject_inverted_plan_both_directions() {
+    let (db, id) = release_cluster();
+    assert!(db.set_release_target(id, "beta", "1.4").unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+    assert!(!db.set_release_target(id, "stable", "1.3").unwrap());
+    assert!(!db.set_release_target(id, "beta", "1.5").unwrap());
+}

@@ -11,10 +11,13 @@ use crate::board::fenced;
 use crate::db::ClusterRow;
 use crate::triage::score;
 
-/// Numbers in a version string, plus whether it is a release (not a dev or
-/// rc build). `0.9.1-dev.2026...` sorts before `0.9.1`, which sorts before `0.9.2`.
-pub fn version_key(v: &str) -> (Vec<u64>, bool, Vec<u64>) {
-    let (core, pre) = match v.split_once(['-', '+']) {
+/// Sort key for a version string: numeric components, release stage, then the
+/// numeric prerelease identifiers. Build metadata (`+...`) never affects
+/// precedence. Stages order `dev < beta < rc < release`, so
+/// `1.4-dev.20260101` sorts before `1.4-rc.1`, which sorts before `1.4`.
+pub fn version_key(v: &str) -> (Vec<u64>, u8, Vec<u64>) {
+    let v = v.split('+').next().unwrap_or(v);
+    let (core, pre) = match v.split_once('-') {
         Some((c, p)) => (c, Some(p)),
         None => (v, None),
     };
@@ -28,12 +31,37 @@ pub fn version_key(v: &str) -> (Vec<u64>, bool, Vec<u64>) {
     while triple.len() < 3 {
         triple.push(0);
     }
-    let is_pre = pre.is_some_and(|p| p.starts_with(|c: char| c.is_ascii_alphabetic()));
-    (triple, !is_pre, pre.map(nums).unwrap_or_default())
+    // 0 dev, 1 beta (and any other named prerelease), 2 rc, 3 release.
+    let stage = match pre {
+        None => 3,
+        Some(p) => {
+            let name: String = p
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            match name.as_str() {
+                "dev" => 0,
+                "rc" => 2,
+                _ => 1,
+            }
+        }
+    };
+    (triple, stage, pre.map(nums).unwrap_or_default())
 }
 
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     version_key(a).cmp(&version_key(b))
+}
+
+/// A version string must start with a digit and contain only version
+/// characters (`[0-9A-Za-z.+-]`). This keeps empty, whitespace, markdown and
+/// other malformed values out of stored release plans.
+pub fn valid_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.starts_with(|c: char| c.is_ascii_digit())
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
 /// Confidence wording from how much evidence there is.

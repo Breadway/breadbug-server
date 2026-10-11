@@ -132,6 +132,15 @@ pub fn releases_of(c: &ClusterRow) -> Option<ReleaseTrack> {
 /// Longest version string the release columns accept.
 pub const MAX_VERSION: usize = 128;
 
+/// The stored release columns for one cluster, used to validate an update
+/// against the effective (confirmed or planned) version on the other channel.
+struct ReleaseState {
+    target_beta: Option<String>,
+    target_stable: Option<String>,
+    confirmed_beta: Option<String>,
+    confirmed_stable: Option<String>,
+}
+
 /// A report shown as evidence in the triage view.
 #[derive(Debug, Clone)]
 pub struct SampleRow {
@@ -663,7 +672,13 @@ impl Db {
                 progress,
                 releases,
             },
-            _ => received,
+            // A single fresh report: still surface any planned releases.
+            _ => PublicStatus {
+                status: "received",
+                fixed_in: None,
+                progress,
+                releases,
+            },
         }))
     }
 
@@ -859,84 +874,137 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
         )? > 0)
     }
 
-    fn release_targets(&self, id: i64) -> Result<Option<(Option<String>, Option<String>)>> {
-        Ok(self
-            .conn()
+    /// Planned targets and confirmed releases for both channels, if the
+    /// cluster exists and is not merged away.
+    fn release_state(conn: &Connection, id: i64) -> Result<Option<ReleaseState>> {
+        Ok(conn
             .query_row(
-                "SELECT target_beta, target_stable FROM clusters WHERE id = ?1 AND merged_into IS NULL",
+                "SELECT target_beta, target_stable, confirmed_beta, confirmed_stable
+                 FROM clusters WHERE id = ?1 AND merged_into IS NULL",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok(ReleaseState {
+                        target_beta: r.get(0)?,
+                        target_stable: r.get(1)?,
+                        confirmed_beta: r.get(2)?,
+                        confirmed_stable: r.get(3)?,
+                    })
+                },
             )
             .optional()?)
     }
 
-    fn valid_version(version: &str) -> bool {
-        !version.is_empty() && version.len() <= MAX_VERSION
+    /// beta must never be newer than stable once each channel's effective
+    /// version (the confirmed release if shipped, otherwise the planned
+    /// target) is known.
+    fn ordering_ok(beta: &Option<String>, stable: &Option<String>) -> bool {
+        match (beta, stable) {
+            (Some(b), Some(s)) => {
+                crate::lifecycle::version_cmp(b, s) != std::cmp::Ordering::Greater
+            }
+            _ => true,
+        }
+    }
+
+    fn valid_release_version(version: &str) -> bool {
+        crate::lifecycle::valid_version(version) && version.len() <= MAX_VERSION
     }
 
     /// Plan the fix or feature for a beta or stable application release.
-    /// The beta target must not be newer than the stable target. Returns
-    /// false for a bad channel, a bad version, bad ordering, or no cluster.
+    /// The beta target must not be newer than the stable target, malformed
+    /// versions are refused, and the read plus write happen in one
+    /// transaction so concurrent updates cannot interleave into an inverted
+    /// plan. Returns false for a bad channel or version, bad ordering, or no
+    /// cluster.
     pub fn set_release_target(&self, id: i64, channel: &str, version: &str) -> Result<bool> {
-        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_release_version(version) {
             return Ok(false);
         }
-        let Some((beta, stable)) = self.release_targets(id)? else {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let Some(state) = Self::release_state(&conn, id)? else {
             return Ok(false);
         };
-        let (beta, stable) = match channel {
-            "beta" => (Some(version.to_string()), stable),
-            _ => (beta, Some(version.to_string())),
+        // A confirmed release dominates a later plan for the same channel.
+        let (eff_beta, eff_stable) = if channel == "beta" {
+            (
+                state.confirmed_beta.clone().or(Some(version.to_string())),
+                state
+                    .confirmed_stable
+                    .clone()
+                    .or(state.target_stable.clone()),
+            )
+        } else {
+            (
+                state.confirmed_beta.clone().or(state.target_beta.clone()),
+                state.confirmed_stable.clone().or(Some(version.to_string())),
+            )
         };
-        if let (Some(b), Some(s)) = (&beta, &stable) {
-            if crate::lifecycle::version_cmp(b, s) == std::cmp::Ordering::Greater {
-                return Ok(false);
-            }
+        if !Self::ordering_ok(&eff_beta, &eff_stable) {
+            return Ok(false);
         }
         let column = if channel == "beta" {
             "target_beta"
         } else {
             "target_stable"
         };
-        Ok(self.conn().execute(
+        let changed = tx.execute(
             &format!("UPDATE clusters SET {column} = ?2 WHERE id = ?1 AND merged_into IS NULL"),
             params![id, version],
-        )? > 0)
+        )? > 0;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Confirm the fix or feature actually shipped in a channel release.
-    /// The channel must have a planned target first. Returns false
-    /// otherwise, or for a bad channel, version, or cluster.
+    /// The channel must have a planned target first. The confirmed version
+    /// must be well formed and must keep beta no newer than stable. Returns
+    /// false otherwise, or for a bad channel or cluster.
     pub fn mark_release_confirmed(&self, id: i64, channel: &str, version: &str) -> Result<bool> {
-        if !matches!(channel, "beta" | "stable") || !Self::valid_version(version) {
+        if !matches!(channel, "beta" | "stable") || !Self::valid_release_version(version) {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let Some(state) = Self::release_state(&conn, id)? else {
+            return Ok(false);
+        };
+        let planned = if channel == "beta" {
+            &state.target_beta
+        } else {
+            &state.target_stable
+        };
+        if planned.is_none() {
+            return Ok(false);
+        }
+        let (eff_beta, eff_stable) = if channel == "beta" {
+            (
+                Some(version.to_string()),
+                state
+                    .confirmed_stable
+                    .clone()
+                    .or(state.target_stable.clone()),
+            )
+        } else {
+            (
+                state.confirmed_beta.clone().or(state.target_beta.clone()),
+                Some(version.to_string()),
+            )
+        };
+        if !Self::ordering_ok(&eff_beta, &eff_stable) {
             return Ok(false);
         }
         let column = if channel == "beta" {
-            ("confirmed_beta", "target_beta")
+            "confirmed_beta"
         } else {
-            ("confirmed_stable", "target_stable")
+            "confirmed_stable"
         };
-        let planned: Option<Option<String>> = self
-            .conn()
-            .query_row(
-                &format!(
-                    "SELECT {} FROM clusters WHERE id = ?1 AND merged_into IS NULL",
-                    column.1
-                ),
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if !matches!(planned, Some(Some(_))) {
-            return Ok(false);
-        }
-        Ok(self.conn().execute(
-            &format!(
-                "UPDATE clusters SET {} = ?2 WHERE id = ?1 AND merged_into IS NULL",
-                column.0
-            ),
+        let changed = tx.execute(
+            &format!("UPDATE clusters SET {column} = ?2 WHERE id = ?1 AND merged_into IS NULL"),
             params![id, version],
-        )? > 0)
+        )? > 0;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn mark_fixed(&self, id: i64, version: &str) -> Result<bool> {
