@@ -14,6 +14,7 @@ name = "breadbug-server"
 path = "src/main.rs"
 
 [dependencies]
+url = "2"
 addr2line = "0.25"
 anyhow = "1"
 axum = "0.8"
@@ -29,6 +30,7 @@ sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1.40", features = ["full"] }
 tracing = "0.1"
+ureq = { version = "2", default-features = false, features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

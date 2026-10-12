@@ -29,6 +29,9 @@ type DeleteRow = (i64, String, String, Option<i64>, Option<String>, String);
 /// `(build_id, app, app_version, count)` of symbols we were asked for but lack.
 pub type MissingSymbols = (String, String, Option<String>, u64);
 
+/// `(cluster id, centroid, reports folded into it)`.
+pub type FuzzyCandidate = (i64, Vec<f32>, u64);
+
 /// A stored report, for maintenance jobs.
 pub struct StoredReport {
     pub id: i64,
@@ -149,6 +152,10 @@ const MIGRATIONS: &[&str] = &[
         last_seen   INTEGER NOT NULL,
         count       INTEGER NOT NULL DEFAULT 1
     );",
+    // 4: fuzzy-cluster centroids
+    "ALTER TABLE clusters ADD COLUMN embedding BLOB;
+    ALTER TABLE clusters ADD COLUMN emb_n INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE clusters ADD COLUMN emb_model TEXT;",
 ];
 
 impl Db {
@@ -454,6 +461,64 @@ impl Db {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Centroids of live fuzzy clusters for `(app, kind)` made with `model`:
+    /// `(cluster id, centroid, reports folded in)`.
+    pub fn fuzzy_candidates(
+        &self,
+        app: &str,
+        kind: &str,
+        model: &str,
+    ) -> Result<Vec<FuzzyCandidate>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding, emb_n FROM clusters
+             WHERE fingerprint IS NULL AND merged_into IS NULL AND app = ?1 AND kind = ?2
+               AND emb_model = ?3 AND embedding IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![app, kind, model], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::embed::from_bytes(&r.get::<_, Vec<u8>>(1)?),
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_embedding(&self, id: i64, v: &[f32], n: u64, model: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET embedding = ?2, emb_n = ?3, emb_model = ?4 WHERE id = ?1",
+            params![id, crate::embed::to_bytes(v), n as i64, model],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of live fuzzy (unfingerprinted) clusters.
+    pub fn fuzzy_cluster_ids(&self) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM clusters WHERE fingerprint IS NULL AND merged_into IS NULL ORDER BY id",
+        )?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The stored (scrubbed) JSON of every clean report in a cluster.
+    pub fn cluster_report_raws(&self, id: i64) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT raw FROM reports WHERE cluster_id = ?1 AND quarantined = 0 ORDER BY id",
+        )?;
+        let raws = stmt
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(raws)
     }
 
     /// Test hook: overwrite a cluster's fingerprint to simulate older rules.

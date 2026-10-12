@@ -7,6 +7,7 @@
 use anyhow::Result;
 
 use crate::db::{Contribution, Db};
+use crate::embed::{centroid, cosine, report_text, title_for, tokens, Embedder};
 use crate::fingerprint::fingerprint;
 use crate::schema::Report;
 
@@ -15,12 +16,34 @@ pub fn kind_of(report: &Report) -> &'static str {
     report.report_type.as_str()
 }
 
-/// Assign a stored report to a cluster. Returns the cluster id, or `None`
-/// when the report has no fingerprint.
-pub fn assign(db: &Db, report_id: i64, report: &Report, install_hash: &str) -> Result<Option<i64>> {
-    let Some(fp) = fingerprint(report) else {
-        return Ok(None);
-    };
+/// How fuzzy matching is done for reports with no fingerprint.
+pub struct Fuzzy<'a> {
+    pub embedder: &'a dyn Embedder,
+    pub threshold: f32,
+}
+
+/// Fewer distinct meaningful words than this and there is nothing to match on.
+const MIN_TOKENS: usize = 3;
+
+/// Distinct words, ignoring the report-type label that every text carries.
+fn meaningful(text: &str) -> usize {
+    tokens(text)
+        .into_iter()
+        .filter(|t| !matches!(t.as_str(), "crash" | "freeze" | "behavior"))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Assign a stored report to a cluster: by fingerprint when it has one,
+/// otherwise by similarity. Returns the cluster id, or `None` when there is
+/// nothing to cluster on.
+pub fn assign(
+    db: &Db,
+    report_id: i64,
+    report: &Report,
+    install_hash: &str,
+    fuzzy: Option<&Fuzzy<'_>>,
+) -> Result<Option<i64>> {
     let c = Contribution {
         report_id,
         install_hash,
@@ -28,13 +51,77 @@ pub fn assign(db: &Db, report_id: i64, report: &Report, install_hash: &str) -> R
         os_build: report.system.os_build.as_deref(),
         at: crate::app::now_unix(),
     };
-    Ok(Some(db.assign_fingerprint(
-        &report.app.id,
-        kind_of(report),
-        &fp.key,
-        &fp.title,
-        &c,
-    )?))
+    if let Some(fp) = fingerprint(report) {
+        return Ok(Some(db.assign_fingerprint(
+            &report.app.id,
+            kind_of(report),
+            &fp.key,
+            &fp.title,
+            &c,
+        )?));
+    }
+    match fuzzy {
+        Some(f) => assign_fuzzy(db, f, report, &c),
+        None => Ok(None),
+    }
+}
+
+fn assign_fuzzy(
+    db: &Db,
+    f: &Fuzzy<'_>,
+    report: &Report,
+    c: &Contribution<'_>,
+) -> Result<Option<i64>> {
+    let text = report_text(report);
+    if meaningful(&text) < MIN_TOKENS {
+        return Ok(None);
+    }
+    let v = f.embedder.embed(&text)?;
+    let model = f.embedder.model();
+    let best = db
+        .fuzzy_candidates(&report.app.id, kind_of(report), model)?
+        .into_iter()
+        .map(|(id, cen, n)| (cosine(&v, &cen), id, cen, n))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    match best {
+        Some((score, id, cen, n)) if score >= f.threshold => {
+            let id = db.assign_to(id, c)?;
+            // Fold this report into the running centroid.
+            let scaled: Vec<f32> = cen.iter().map(|x| x * n as f32).collect();
+            if let Some(new) = centroid(&[scaled, v]).filter(|_| n > 0) {
+                db.set_embedding(id, &new, n + 1, model)?;
+            }
+            Ok(Some(id))
+        }
+        _ => {
+            let id = db.new_cluster(&report.app.id, kind_of(report), &title_for(report), c)?;
+            db.set_embedding(id, &v, 1, model)?;
+            Ok(Some(id))
+        }
+    }
+}
+
+/// Recompute every fuzzy cluster's centroid from its member reports, for
+/// when the embedding model changes. Returns how many were updated.
+pub fn reembed_all(db: &Db, embedder: &dyn Embedder) -> Result<usize> {
+    let mut updated = 0;
+    for id in db.fuzzy_cluster_ids()? {
+        let mut vectors = Vec::new();
+        for raw in db.cluster_report_raws(id)? {
+            let Ok(report) = serde_json::from_str::<Report>(&raw) else {
+                continue;
+            };
+            let text = report_text(&report);
+            if meaningful(&text) >= MIN_TOKENS {
+                vectors.push(embedder.embed(&text)?);
+            }
+        }
+        if let Some(c) = centroid(&vectors) {
+            db.set_embedding(id, &c, vectors.len() as u64, embedder.model())?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 /// Re-run fingerprinting over every stored clean report, for when the

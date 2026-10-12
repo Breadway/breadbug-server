@@ -37,6 +37,15 @@ pub struct Config {
     /// Debug symbols keyed by build-id (`<xx>/<build-id>.debug`), published
     /// by the release pipeline. Defaults to `<data_dir>/symbols`.
     pub symbol_dir: Option<PathBuf>,
+    /// Cosine similarity at which a report joins an existing fuzzy cluster.
+    /// Tuned on `tests/fixtures/fuzzy_eval.json` (see docs/embedding-eval.md).
+    pub fuzzy_threshold: f32,
+    /// Local embedding service (`http://127.0.0.1:...`); the built-in hashing
+    /// embedder is used when unset.
+    pub embed_url: Option<String>,
+    /// Name recorded with vectors from `embed_url`, so a model change forces
+    /// a re-embed instead of mixing vector spaces.
+    pub embed_model: String,
 }
 
 impl Default for Config {
@@ -55,6 +64,9 @@ impl Default for Config {
             trust_proxy: false,
             max_db_bytes: 2 * 1024 * 1024 * 1024,
             symbol_dir: None,
+            fuzzy_threshold: 0.30,
+            embed_url: None,
+            embed_model: "default".to_string(),
         }
     }
 }
@@ -112,6 +124,17 @@ impl Config {
         }
         if let Some(v) = env_parse("BREADBUG_MAX_DB_BYTES")? {
             c.max_db_bytes = v;
+        }
+        if let Some(v) = env_parse("BREADBUG_FUZZY_THRESHOLD")? {
+            c.fuzzy_threshold = v;
+        }
+        c.embed_url = std::env::var("BREADBUG_EMBED_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if let Ok(v) = std::env::var("BREADBUG_EMBED_MODEL") {
+            if !v.trim().is_empty() {
+                c.embed_model = v.trim().to_string();
+            }
         }
         if let Some(v) = env_parse::<PathBuf>("BREADBUG_SYMBOL_DIR")? {
             c.symbol_dir = Some(v);
