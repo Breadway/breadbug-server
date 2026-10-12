@@ -29,6 +29,13 @@ type DeleteRow = (i64, String, String, Option<i64>, Option<String>, String);
 /// `(build_id, app, app_version, count)` of symbols we were asked for but lack.
 pub type MissingSymbols = (String, String, Option<String>, u64);
 
+/// What anyone holding a receipt may learn about their report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicStatus {
+    pub status: &'static str,
+    pub fixed_in: Option<String>,
+}
+
 /// A report shown as evidence in the triage view.
 #[derive(Debug, Clone)]
 pub struct SampleRow {
@@ -456,6 +463,54 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// The coarse, public status of a report, derived from its cluster. Never
+    /// reveals other users' data: only a state word and, once fixed, the
+    /// version the fix shipped in.
+    pub fn public_status(&self, receipt: &str) -> Result<Option<PublicStatus>> {
+        let conn = self.conn();
+        let row: Option<(Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT cluster_id, quarantined FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((cluster, quarantined)) = row else {
+            return Ok(None);
+        };
+        let received = PublicStatus {
+            status: "received",
+            fixed_in: None,
+        };
+        let (Some(cid), 0) = (cluster, quarantined) else {
+            return Ok(Some(received));
+        };
+        let cid = Self::resolve(&conn, cid)?;
+        let Some(c) = Self::cluster_from(&conn, cid)? else {
+            return Ok(Some(received));
+        };
+        Ok(Some(match c.status.as_str() {
+            "promoted" | "investigating" | "regressed" => PublicStatus {
+                status: "investigating",
+                fixed_in: None,
+            },
+            "fixed" => PublicStatus {
+                status: "fixed",
+                fixed_in: c.fixed_in,
+            },
+            "dismissed" => PublicStatus {
+                status: "closed",
+                fixed_in: None,
+            },
+            // A known problem others have already reported.
+            _ if c.count > 1 => PublicStatus {
+                status: "duplicate",
+                fixed_in: None,
+            },
+            _ => received,
+        }))
     }
 
     pub fn raw_of(&self, receipt: &str) -> Result<Option<String>> {

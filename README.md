@@ -11,7 +11,7 @@ triage inbox.
 |--------|------|-------|
 | `POST` | `/v1/reports` | Body: the report JSON, exactly as previewed by the client. Headers: `X-Breadbug-Install` (32 hex, random per install), `X-Breadbug-Sha256` (hash of the body, checked). `201 {receipt, deletion_token, status}`; an identical resend returns `200` with the original receipt. `400` invalid, `413` too large, `429` rate limited (`Retry-After`), `503` busy or full |
 | `DELETE` | `/v1/reports/{receipt}` | `Authorization: Bearer <deletion_token>`. `204` on success; `404` for a wrong token and an unknown receipt alike |
-| `GET` | `/v1/reports/{receipt}/status` | `{status}` only: `received`, `investigating`, `fixed`, `duplicate` |
+| `GET` | `/v1/reports/{receipt}/status` | Coarse state only, rate limited: `received`, `duplicate` (a known problem others reported too), `investigating`, `fixed` (+ `fixed_in` when a fix version was recorded) or `closed`. Nothing else about the cluster or other reporters is revealed |
 | `GET` | `/healthz` | liveness |
 
 The wire format is schema 1; see `src/schema.rs` and
