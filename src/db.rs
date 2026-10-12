@@ -105,6 +105,9 @@ pub struct ClusterRow {
     pub os_builds: std::collections::BTreeMap<String, u64>,
     pub fixed_in: Option<String>,
     pub issue_key: Option<String>,
+    /// Whether the fixed state came from the board reaching `done` (so a
+    /// board reopen should re-derive it), as opposed to an admin mark-fixed.
+    pub board_fixed: bool,
     pub merged_into: Option<i64>,
 }
 
@@ -217,6 +220,9 @@ const MIGRATIONS: &[&str] = &[
     // cluster and both tokens must keep working, so more than one live token
     // per install is allowed. Idempotency is handled by rotating in `follow`.
     "DROP INDEX IF EXISTS follows_one_per_install;",
+    // 9: remember that a cluster's fixed state came from the board, so a
+    // board reopen re-derives it while an admin "mark fixed" is left alone.
+    "ALTER TABLE clusters ADD COLUMN board_fixed INTEGER NOT NULL DEFAULT 0;",
 ];
 
 impl Db {
@@ -692,7 +698,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, issue_key FROM clusters
              WHERE issue_key IS NOT NULL AND issue_key != 'pending' AND merged_into IS NULL
-               AND status IN ('promoted', 'regressed', 'investigating', 'new')",
+AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismissed', 'deferred')",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -712,6 +718,27 @@ impl Db {
         Ok(self.conn().execute(
             "UPDATE clusters SET status = 'fixed', fixed_in = ?2 WHERE id = ?1 AND merged_into IS NULL",
             params![id, version],
+        )? > 0)
+    }
+
+    /// Mark a cluster fixed because its board issue reached `done`. Records
+    /// the shipped version when the board provides one and flags the state as
+    /// board-driven, so a later board reopen re-derives it.
+    pub fn mark_fixed_from_board(&self, id: i64, version: Option<&str>) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE clusters SET status = 'fixed', fixed_in = coalesce(?2, fixed_in), board_fixed = 1
+             WHERE id = ?1 AND merged_into IS NULL",
+            params![id, version],
+        )? > 0)
+    }
+
+    /// Return a board-fixed cluster to the promoted state after the board
+    /// moved its issue back out of `done`.
+    pub fn reopen_from_board(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE clusters SET status = 'promoted', board_fixed = 0
+             WHERE id = ?1 AND merged_into IS NULL",
+            params![id],
         )? > 0)
     }
 
@@ -1062,7 +1089,7 @@ impl Db {
             .query_row(
                 "SELECT c.id, c.app, c.kind, c.fingerprint, c.title, c.status, c.first_seen,
                         c.last_seen, c.count, c.versions, c.os_builds, c.fixed_in, c.issue_key,
-                        c.merged_into,
+                        c.board_fixed, c.merged_into,
                         (SELECT count(*) FROM cluster_installs i WHERE i.cluster_id = c.id)
                  FROM clusters c WHERE c.id = ?1",
                 params![id],
@@ -1083,8 +1110,9 @@ impl Db {
                         os_builds: serde_json::from_str(&os_builds).unwrap_or_default(),
                         fixed_in: r.get(11)?,
                         issue_key: r.get(12)?,
-                        merged_into: r.get(13)?,
-                        installs: r.get::<_, i64>(14)? as u64,
+                        board_fixed: r.get(13)?,
+                        merged_into: r.get(14)?,
+                        installs: r.get::<_, i64>(15)? as u64,
                     })
                 },
             )

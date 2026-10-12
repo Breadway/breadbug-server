@@ -327,8 +327,9 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
     Ok(())
 }
 
-/// Hourly: promoted clusters whose issue reached `done` are marked fixed.
-/// Returns how many changed.
+/// Hourly: clusters whose board issue reached `done` are marked fixed, and a
+/// cluster whose issue the board has reopened is returned to the promoted
+/// state. Returns how many changed.
 pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     let Some(board) = s.board() else {
         return Ok(0);
@@ -339,19 +340,23 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
             continue;
         };
         let Some(c) = s.db.cluster(id)? else { continue };
-        if state.status == "done" && c.status != "fixed" {
-            // Persist the board's fix version when it records one, so the
-            // public "fixed in" and the regression threshold use it. With no
-            // version, regression is judged against versions already seen
-            // (see `after_report`).
-            match state.fix_version {
-                Some(v) => {
-                    s.db.mark_fixed(id, &v)?;
-                }
-                None => {
-                    s.db.set_status(id, "fixed")?;
-                }
+        let live = matches!(
+            c.status.as_str(),
+            "promoted" | "regressed" | "investigating" | "new"
+        );
+        if state.status == "done" {
+            if live {
+                // Persist the board's fix version when it records one, and
+                // flag the state as board-driven so a later reopen re-derives
+                // it while an admin mark-fixed (which records a version) is
+                // left alone.
+                s.db.mark_fixed_from_board(id, state.fix_version.as_deref())?;
+                changed += 1;
             }
+        } else if c.status == "fixed" && c.board_fixed {
+            // The board moved a done issue back out of done, so re-derive the
+            // public state.
+            s.db.reopen_from_board(id)?;
             changed += 1;
         }
     }

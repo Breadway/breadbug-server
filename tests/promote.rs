@@ -597,16 +597,6 @@ async fn sync(st: &Arc<AppState>) {
         .unwrap();
 }
 
-async fn promote_blocking(st: &Arc<AppState>, id: i64) -> String {
-    tokio::task::spawn_blocking({
-        let st = st.clone();
-        move || promote(&st, id)
-    })
-    .await
-    .unwrap()
-    .unwrap()
-}
-
 #[tokio::test]
 async fn done_with_a_fix_version_is_persisted_and_gates_regression() {
     let m = mock_board();
@@ -675,4 +665,21 @@ async fn hostile_versions_and_os_builds_are_flattened_in_the_issue_body() {
     // The hostile text is still present, flattened to one line.
     assert!(body.contains("0.3 ## boom"), "{body}");
     assert!(body.contains("os-1 ### inject"), "{body}");
+}
+
+#[tokio::test]
+async fn an_admin_fixed_cluster_is_not_reopened_by_the_board() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r = post(&st, 1, &crash("0.3", "boom")).await;
+    let id = cluster_id(&st, &r);
+    promote_blocking(&st, id).await;
+    // Admin marks it fixed in a version: this is not a board-driven fix.
+    assert!(st.db.mark_fixed(id, "0.4.0").unwrap());
+    // The board issue is still in doing: sync must not undo the admin fix.
+    *m.issue_status.lock().unwrap() = "doing".into();
+    sync(&st).await;
+    let c = st.db.cluster(id).unwrap().unwrap();
+    assert_eq!(c.status, "fixed");
+    assert!(!c.board_fixed);
 }
