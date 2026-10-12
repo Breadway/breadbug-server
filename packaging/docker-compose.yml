@@ -19,6 +19,8 @@ services:
     environment:
       BREADBUG_TRUST_PROXY: "1"
       BREADBUG_RETENTION_DAYS: "90"
+      # public base of the cluster pages, linked from promoted issues
+      BREADBUG_CLUSTER_URL: "${BREADBUG_CLUSTER_URL:-}"
       # sha256 of the admin bearer token; unset disables the admin UI
       BREADBUG_ADMIN_TOKEN_SHA256: "${BREADBUG_ADMIN_TOKEN_SHA256:-}"
     volumes:

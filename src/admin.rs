@@ -471,9 +471,17 @@ async fn detail(
         "<fieldset><legend>Actions</legend>\
          <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/status\">{csrf}<select name=\"status\">{status_opts}</select> <button>Set status</button></form> \
          <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/fixed\">{csrf}<input name=\"version\" placeholder=\"fixed in version\" size=\"14\"> <button>Mark fixed</button></form> \
-         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/merge\">{csrf}<input name=\"into\" placeholder=\"merge into #\" size=\"10\"> <button>Merge</button></form>\
+         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/merge\">{csrf}<input name=\"into\" placeholder=\"merge into #\" size=\"10\"> <button>Merge</button></form>{promote}\
          </fieldset>",
-        id = c.id
+        id = c.id,
+        promote = if s.board().is_some() && c.issue_key.is_none() && c.status != "dismissed" {
+            format!(
+                " <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{}/promote\">{csrf}<button>Promote to breadboard issue</button></form>",
+                c.id
+            )
+        } else {
+            String::new()
+        }
     );
     let _ = write!(b, "<h2>Latest reports</h2>");
     for sm in &samples {
@@ -585,6 +593,27 @@ async fn merge(
             "Cannot merge (unknown, same cluster, or different app).",
         ),
         _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not merge."),
+    }
+}
+
+async fn promote(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<CsrfOnly>,
+) -> Response {
+    let session = match authenticate(&s, &headers) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !csrf_ok(&session, f.csrf.as_deref().unwrap_or("")) {
+        return notice(StatusCode::FORBIDDEN, "Bad CSRF token.");
+    }
+    let st = s.clone();
+    match tokio::task::spawn_blocking(move || crate::lifecycle::promote(&st, id)).await {
+        Ok(Ok(_key)) => back_to(id),
+        Ok(Err(e)) => notice(StatusCode::BAD_REQUEST, &format!("Could not promote: {e}")),
+        Err(_) => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not promote."),
     }
 }
 
@@ -721,6 +750,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/admin/clusters/{id}/status", post(set_status))
         .route("/admin/clusters/{id}/fixed", post(mark_fixed))
         .route("/admin/clusters/{id}/merge", post(merge))
+        .route("/admin/clusters/{id}/promote", post(promote))
         .route("/admin/quarantine", get(quarantine))
         .route("/admin/quarantine/{id}/{action}", post(quarantine_action))
         .route("/admin/symbols", get(symbols_page))

@@ -32,6 +32,20 @@ sends a CSP with no scripts and escapes every value from a report.
   merge a duplicate cluster into this one.
 * **Quarantine**: reports the server's scrub found something in; release,
   delete, or delete and ban the install.
+* **Promote**: files a breadboard issue for the cluster (project from the app,
+  priority from the score) with how it was found, a confidence level, counts,
+  versions and fenced, inert evidence. Needs `BREADBUG_BOARD_URL` and a
+  dedicated minimum-scope token (`BREADBUG_BOARD_TOKEN_FILE`); override the app
+  to project mapping with `BREADBUG_BOARD_PROJECTS=clip=CLIP,...`. After
+  promotion, each doubling of the report count (from 4) comments on the issue
+  and may raise its priority (never lower it); an issue reaching `done` marks
+  the cluster fixed, reading the shipped version from a `fixed-in:<version>`
+  label on the issue if present (breadboard has no fix-version field of its
+  own); a report from a version not older than the recorded fix
+  (or, with no fix version, newer than anything seen) marks it `regressed`,
+  comments and reopens the issue. Set `BREADBUG_CLUSTER_URL` to the public
+  base of this server's cluster pages and promoted issues link back to the
+  cluster at `<BREADBUG_CLUSTER_URL>/<id>`.
 * **Missing symbols**: build-ids the symbol store lacks.
 
 ## Running
@@ -43,7 +57,9 @@ cargo run   # data in ./data, public listener 127.0.0.1:8120
 Configuration is environment variables (`src/config.rs`): `BREADBUG_DATA_DIR`,
 `BREADBUG_PUBLIC_ADDR`, `BREADBUG_ADMIN_ADDR`, `BREADBUG_ADMIN_TOKEN_SHA256`,
 `BREADBUG_MAX_BODY_BYTES`, `BREADBUG_RETENTION_DAYS`,
-`BREADBUG_SYMBOL_DIR`, `BREADBUG_FUZZY_THRESHOLD`, `BREADBUG_EMBED_URL`, `BREADBUG_EMBED_MODEL`,
+`BREADBUG_BOARD_URL`, `BREADBUG_BOARD_TOKEN_FILE`, `BREADBUG_BOARD_PROJECTS`,
+`BREADBUG_CLUSTER_URL`,
+`BREADBUG_TRIAGE_RULES`, `BREADBUG_SYMBOL_DIR`, `BREADBUG_FUZZY_THRESHOLD`, `BREADBUG_EMBED_URL`, `BREADBUG_EMBED_MODEL`,
 `BREADBUG_PER_INSTALL_PER_HOUR`, `BREADBUG_PER_NETWORK_PER_HOUR`,
 `BREADBUG_GLOBAL_PER_HOUR`, `BREADBUG_MAX_IN_FLIGHT`, `BREADBUG_TRUST_PROXY`
 (set behind Caddy), `BREADBUG_MAX_DB_BYTES`.
