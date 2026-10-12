@@ -202,6 +202,25 @@ fn cluster_id(st: &AppState, receipt: &str) -> i64 {
     st.db.cluster_of(receipt).unwrap().unwrap()
 }
 
+async fn status_of(st: &Arc<AppState>, receipt: &str) -> Value {
+    let req = Request::builder()
+        .uri(format!("/v1/reports/{receipt}/status"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = public_router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&b).unwrap()
+}
+
+async fn sync(st: &Arc<AppState>) {
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || sync_issue_states(&st2))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn by_path(m: &Mock, method: &str, prefix: &str) -> Vec<Req> {
     m.seen
         .lock()
@@ -321,6 +340,57 @@ async fn promote_manual_and_request_clusters_carry_their_text() {
     assert_eq!(
         (cluster.status.as_str(), cluster.issue_key.as_deref()),
         ("promoted", Some("CLIP-10"))
+    );
+}
+
+#[tokio::test]
+async fn public_progress_follows_the_board_issue_through_every_stage() {
+    let m = mock_board();
+    let (st, _d) = state(Some(&m));
+    let r = post(&st, 1, &crash("0.3", "boom")).await;
+    let id = cluster_id(&st, &r);
+
+    // Not promoted yet: no progress field at all.
+    assert_eq!(status_of(&st, &r).await, json!({"status": "received"}));
+
+    promote_blocking(&st, id).await;
+    sync(&st).await;
+    // The mock board starts at backlog: accepted.
+    assert_eq!(
+        status_of(&st, &r).await,
+        json!({"status": "investigating", "progress": "accepted"})
+    );
+    for (board, stage) in [
+        ("todo", "accepted"),
+        ("doing", "in_development"),
+        ("review", "in_review"),
+    ] {
+        *m.issue_status.lock().unwrap() = board.into();
+        sync(&st).await;
+        assert_eq!(
+            status_of(&st, &r).await,
+            json!({"status": "investigating", "progress": stage}),
+            "{board}"
+        );
+    }
+    // Board done: the cluster is fixed and progress is completed.
+    *m.issue_status.lock().unwrap() = "done".into();
+    sync(&st).await;
+    assert_eq!(
+        status_of(&st, &r).await,
+        json!({"status": "fixed", "progress": "completed"})
+    );
+
+    // A dismissed cluster reads declined; a deferred one reads deferred.
+    assert!(st.db.set_status(id, "dismissed").unwrap());
+    assert_eq!(
+        status_of(&st, &r).await,
+        json!({"status": "closed", "progress": "declined"})
+    );
+    assert!(st.db.set_status(id, "deferred").unwrap());
+    assert_eq!(
+        status_of(&st, &r).await,
+        json!({"status": "investigating", "progress": "deferred"})
     );
 }
 

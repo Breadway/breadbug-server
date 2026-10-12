@@ -480,9 +480,11 @@ async fn detail(
         c.fixed_in
             .as_deref()
             .map_or(String::new(), |v| format!(", fixed in {}", esc(v))),
-        c.issue_key
-            .as_deref()
-            .map_or(String::new(), |k| format!(", issue {}", esc(k)))
+        c.issue_key.as_deref().map_or(String::new(), |k| format!(
+            ", issue {} ({})",
+            esc(k),
+            esc(c.issue_status.as_deref().unwrap_or("status unknown"))
+        ))
     );
     let _ = write!(
         b,

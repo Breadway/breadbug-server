@@ -447,6 +447,9 @@ async fn report_status(
             if let Some(v) = st.fixed_in {
                 body["fixed_in"] = json!(v);
             }
+            if let Some(p) = st.progress {
+                body["progress"] = json!(p);
+            }
             Json(body).into_response()
         }
         Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),

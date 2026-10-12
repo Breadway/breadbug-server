@@ -71,3 +71,91 @@ fn migrations_are_idempotent_on_disk() {
     let db = Db::open(&p).unwrap();
     assert_eq!(db.report_count().unwrap(), 1);
 }
+
+fn row() -> ClusterRow {
+    ClusterRow {
+        id: 1,
+        app: "clip".into(),
+        kind: "crash".into(),
+        fingerprint: None,
+        title: "t".into(),
+        status: "new".into(),
+        first_seen: 0,
+        last_seen: 0,
+        count: 1,
+        installs: 1,
+        versions: Default::default(),
+        os_builds: Default::default(),
+        fixed_in: None,
+        issue_key: None,
+        issue_status: None,
+        merged_into: None,
+    }
+}
+
+#[test]
+fn progress_mapping_covers_every_stage() {
+    // No linked issue: no progress, whatever the cluster state.
+    let mut c = row();
+    assert_eq!(progress_of(&c), None);
+    // A pending promotion claim is not a linked issue yet.
+    c.issue_key = Some("pending".into());
+    c.issue_status = Some("todo".into());
+    assert_eq!(progress_of(&c), None);
+    // Linked issue, board states map to stages.
+    c.issue_key = Some("CLIP-9".into());
+    for (board, stage) in [
+        ("backlog", "accepted"),
+        ("todo", "accepted"),
+        ("doing", "in_development"),
+        ("review", "in_review"),
+        ("done", "completed"),
+    ] {
+        c.status = "promoted".into();
+        c.issue_status = Some(board.into());
+        assert_eq!(progress_of(&c), Some(stage), "{board}");
+    }
+    // Unknown cached values stay silent rather than leaking.
+    c.issue_status = Some("archived".into());
+    assert_eq!(progress_of(&c), None);
+    c.issue_status = None;
+    assert_eq!(progress_of(&c), None);
+    // Cluster verdicts win over the board state.
+    c.issue_status = Some("doing".into());
+    c.status = "dismissed".into();
+    assert_eq!(progress_of(&c), Some("declined"));
+    c.status = "deferred".into();
+    assert_eq!(progress_of(&c), Some("deferred"));
+    c.status = "fixed".into();
+    assert_eq!(progress_of(&c), Some("completed"));
+}
+
+#[test]
+fn unknown_issue_statuses_are_not_cached() {
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .new_cluster(
+            "clip",
+            "crash",
+            "t",
+            &Contribution {
+                report_id: 0,
+                install_hash: "i1",
+                version: Some("0.3"),
+                os_build: None,
+                at: 1,
+            },
+        )
+        .unwrap();
+    assert!(db.set_issue_status(id, "doing").unwrap());
+    assert_eq!(
+        db.cluster(id).unwrap().unwrap().issue_status.as_deref(),
+        Some("doing")
+    );
+    assert!(!db.set_issue_status(id, "archived").unwrap());
+    assert_eq!(
+        db.cluster(id).unwrap().unwrap().issue_status.as_deref(),
+        Some("doing")
+    );
+    assert!(!db.set_issue_status(999, "doing").unwrap());
+}
