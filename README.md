@@ -2,8 +2,7 @@
 
 The server side of [breadbug](https://git.breadway.dev/Breadway/bread/src/branch/main/docs/breadbug.md):
 it receives opt-in crash, freeze and bug reports from bread apps, re-scrubs
-them, stores them, and (in later releases) groups duplicates and feeds a
-triage inbox.
+them, stores them, groups duplicates, and feeds a triage inbox.
 
 ## API (public listener, port 8120)
 
@@ -12,7 +11,7 @@ triage inbox.
 | `POST` | `/v1/reports` | Body: the report JSON, exactly as previewed by the client. Headers: `X-Breadbug-Install` (32 hex, random per install), `X-Breadbug-Sha256` (hash of the body, checked). `201 {receipt, deletion_token, status}`; an identical resend returns `200` with the original receipt. `400` invalid, `413` too large, `429` rate limited (`Retry-After`), `503` busy or full |
 | `DELETE` | `/v1/reports/{receipt}` | `Authorization: Bearer <deletion_token>`. `204` on success; `404` for a wrong token and an unknown receipt alike |
 | `GET` | `/v1/reports/{receipt}/status` | Coarse state only, rate limited: `received`, `duplicate` (a known problem others reported too), `investigating`, `fixed` (+ `fixed_in` when a fix version was recorded) or `closed`. Linked issues and fixed clusters also carry `progress`: `accepted`, `in_development`, `fixed`, `targeting_release`, `completed`, `declined` or `deferred`. Clusters with release plans carry `releases` with per-channel `planned`, `shipped` and `shipped_in` for `beta` and `stable` (per application release, never per BOS release). Nothing else about the cluster or other reporters is revealed |
-| `POST` | `/v1/reports/{receipt}/follow` | Follow the issue behind a report, anonymously. Header `X-Breadbug-Install` required (ban-checked). `201 {follow_token, status}`; resubscribing returns `200 {status, duplicate: true}` with no new token. `404` unknown receipt, `409` stored but not grouped yet, `403` banned |
+| `POST` | `/v1/reports/{receipt}/follow` | Follow the issue behind a report, no account. The reporter sends `Authorization: Bearer <deletion_token>` (no install id needed); any other subscriber sends `X-Breadbug-Install` (ban-checked). `201 {follow_token, status}` on the first follow; following again rotates the token and returns `200` with the new `follow_token`, so a lost first response is recoverable. `404` unknown receipt, `409` stored but not grouped yet, `403` banned or wrong token |
 | `DELETE` | `/v1/follows/{follow_token}` | Stop following. `204` on success, `404` for an unknown token |
 | `GET` | `/v1/follows/{follow_token}/notifications` | Pending notices for a follow (`fixed`, `beta`, `stable`, each with a stable id and text naming the app and stage). Non-destructive peek: a notice stays pending until it is acked. Ack with `POST /v1/follows/{follow_token}/notifications/ack` (body `{"ids":[...]}`), and use `GET /v1/follows/{follow_token}/notifications/wait` to hold until a notice is queued (the no-client-poll channel). `404` for an unknown token |
 | `GET` | `/healthz` | liveness |
@@ -60,7 +59,7 @@ cargo run   # data in ./data, public listener 127.0.0.1:8120
 Configuration is environment variables (`src/config.rs`): `BREADBUG_DATA_DIR`,
 `BREADBUG_PUBLIC_ADDR`, `BREADBUG_ADMIN_ADDR`, `BREADBUG_ADMIN_TOKEN_SHA256`,
 `BREADBUG_MAX_BODY_BYTES`, `BREADBUG_RETENTION_DAYS`,
-`BREADBUG_BOARD_URL`, `BREADBUG_BOARD_TOKEN_FILE`, `BREADBUG_BOARD_PROJECTS`,
+`BREADBUG_BOARD_URL`, `BREADBUG_BOARD_TOKEN_FILE` (or `BREADBUG_BOARD_TOKEN`), `BREADBUG_BOARD_PROJECTS`,
 `BREADBUG_CLUSTER_URL`,
 `BREADBUG_TRIAGE_RULES`, `BREADBUG_SYMBOL_DIR`, `BREADBUG_FUZZY_THRESHOLD`, `BREADBUG_EMBED_URL`, `BREADBUG_EMBED_MODEL`,
 `BREADBUG_PER_INSTALL_PER_HOUR`, `BREADBUG_PER_NETWORK_PER_HOUR`,
@@ -95,6 +94,7 @@ progress, release and notification contract with fixtures.
 
 See [docs/threat-model.md](docs/threat-model.md) and
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
 # Backup and deletion contract
 
 Run `python3 packaging/backup.py data/breadbug.db /private/backup/breadbug.db
