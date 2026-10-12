@@ -494,9 +494,13 @@ async fn disk_quota_evicts_oldest_compacts_and_accepts_new_intake() {
         .unwrap();
     }
     db.compact().unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    // Quota sits between one and two raws below the current size, so exactly
+    // the two oldest reports must go regardless of schema overhead.
+    let quota = before - 128 * 1024 - 32 * 1024;
     let cfg = Config {
         data_dir: dir.path().to_path_buf(),
-        max_db_bytes: 220 * 1024,
+        max_db_bytes: quota,
         ..Config::default()
     };
     let h = Harness {
@@ -518,7 +522,7 @@ async fn disk_quota_evicts_oldest_compacts_and_accepts_new_intake() {
     assert!(!bytes
         .windows(b"quota-marker-1".len())
         .any(|w| w == b"quota-marker-1"));
-    assert!(bytes.len() < 220 * 1024);
+    assert!(bytes.len() < quota as usize);
 }
 
 // ---- clustering ---------------------------------------------------------
