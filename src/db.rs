@@ -29,6 +29,37 @@ type DeleteRow = (i64, String, String, Option<i64>, Option<String>, String);
 /// `(build_id, app, app_version, count)` of symbols we were asked for but lack.
 pub type MissingSymbols = (String, String, Option<String>, u64);
 
+/// A report shown as evidence in the triage view.
+#[derive(Debug, Clone)]
+pub struct SampleRow {
+    pub id: i64,
+    pub receipt: String,
+    pub received_at: u64,
+    pub app_version: Option<String>,
+    pub raw: String,
+}
+
+/// A quarantined report awaiting review.
+#[derive(Debug, Clone)]
+pub struct QuarantineRow {
+    pub id: i64,
+    pub receipt: String,
+    pub received_at: u64,
+    pub app: String,
+    pub hits: String,
+    pub raw: String,
+}
+
+/// Statuses a human can put a cluster in.
+pub const STATUSES: &[&str] = &[
+    "new",
+    "investigating",
+    "dismissed",
+    "promoted",
+    "fixed",
+    "regressed",
+];
+
 /// `(cluster id, centroid, reports folded into it)`.
 pub type FuzzyCandidate = (i64, Vec<f32>, u64);
 
@@ -156,6 +187,12 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE clusters ADD COLUMN embedding BLOB;
     ALTER TABLE clusters ADD COLUMN emb_n INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE clusters ADD COLUMN emb_model TEXT;",
+    // 5: banned installs
+    "CREATE TABLE bans (
+        install_hash TEXT PRIMARY KEY,
+        reason       TEXT NOT NULL,
+        banned_at    INTEGER NOT NULL
+    );",
 ];
 
 impl Db {
@@ -519,6 +556,224 @@ impl Db {
             .query_map(params![id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(raws)
+    }
+
+    /// Set a cluster's status. Returns false for an unknown cluster or status.
+    pub fn set_status(&self, id: i64, status: &str) -> Result<bool> {
+        if !STATUSES.contains(&status) {
+            return Ok(false);
+        }
+        Ok(self.conn().execute(
+            "UPDATE clusters SET status = ?2 WHERE id = ?1 AND merged_into IS NULL",
+            params![id, status],
+        )? > 0)
+    }
+
+    /// Mark a cluster fixed in `version`.
+    pub fn mark_fixed(&self, id: i64, version: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE clusters SET status = 'fixed', fixed_in = ?2 WHERE id = ?1 AND merged_into IS NULL",
+            params![id, version],
+        )? > 0)
+    }
+
+    /// Record the breadboard issue a cluster was promoted to.
+    pub fn set_issue(&self, id: i64, key: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE clusters SET status = 'promoted', issue_key = ?2 WHERE id = ?1 AND merged_into IS NULL",
+            params![id, key],
+        )? > 0)
+    }
+
+    /// Fold cluster `from` into `into`: reports, counts, versions, installs.
+    pub fn merge_clusters(&self, from: i64, into: i64) -> Result<bool> {
+        let conn = self.conn();
+        let into = Self::resolve(&conn, into)?;
+        if from == into {
+            return Ok(false);
+        }
+        let (Some(a), Some(b)) = (
+            Self::cluster_from(&conn, from)?,
+            Self::cluster_from(&conn, into)?,
+        ) else {
+            return Ok(false);
+        };
+        if a.merged_into.is_some() || a.app != b.app {
+            return Ok(false);
+        }
+        let tx = conn.unchecked_transaction()?;
+        let mut versions = b.versions.clone();
+        for (k, n) in &a.versions {
+            *versions.entry(k.clone()).or_default() += n;
+        }
+        let mut os_builds = b.os_builds.clone();
+        for (k, n) in &a.os_builds {
+            *os_builds.entry(k.clone()).or_default() += n;
+        }
+        tx.execute(
+            "UPDATE clusters SET count = count + ?2, first_seen = min(first_seen, ?3),
+                                 last_seen = max(last_seen, ?4), versions = ?5, os_builds = ?6
+             WHERE id = ?1",
+            params![
+                into,
+                a.count as i64,
+                a.first_seen as i64,
+                a.last_seen as i64,
+                serde_json::to_string(&versions)?,
+                serde_json::to_string(&os_builds)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO cluster_installs (cluster_id, install_hash)
+             SELECT ?2, install_hash FROM cluster_installs WHERE cluster_id = ?1",
+            params![from, into],
+        )?;
+        tx.execute(
+            "UPDATE reports SET cluster_id = ?2 WHERE cluster_id = ?1",
+            params![from, into],
+        )?;
+        tx.execute(
+            "UPDATE clusters SET merged_into = ?2, count = 0 WHERE id = ?1",
+            params![from, into],
+        )?;
+        tx.execute(
+            "UPDATE clusters SET merged_into = ?2 WHERE merged_into = ?1",
+            params![from, into],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The newest reports in a cluster, for the triage view.
+    pub fn cluster_samples(&self, id: i64, limit: usize) -> Result<Vec<SampleRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, receipt, received_at, app_version, raw FROM reports
+             WHERE cluster_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![id, limit as i64], |r| {
+                Ok(SampleRow {
+                    id: r.get(0)?,
+                    receipt: r.get(1)?,
+                    received_at: r.get::<_, i64>(2)? as u64,
+                    app_version: r.get(3)?,
+                    raw: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn quarantined(&self, limit: usize) -> Result<Vec<QuarantineRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, receipt, received_at, app, rescrub_hits, raw FROM reports
+             WHERE quarantined = 1 ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(QuarantineRow {
+                    id: r.get(0)?,
+                    receipt: r.get(1)?,
+                    received_at: r.get::<_, i64>(2)? as u64,
+                    app: r.get(3)?,
+                    hits: r.get(4)?,
+                    raw: r.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Take a report out of quarantine and return it for clustering.
+    pub fn release_quarantine(&self, id: i64) -> Result<Option<StoredReport>> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE reports SET quarantined = 0 WHERE id = ?1 AND quarantined = 1",
+            params![id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, install_hash, app_version, cluster_id, raw FROM reports WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(StoredReport {
+                        id: r.get(0)?,
+                        install_hash: r.get(1)?,
+                        app_version: r.get(2)?,
+                        cluster_id: r.get(3)?,
+                        raw: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Delete a report by id (admin action), keeping cluster counters right.
+    pub fn delete_report_by_id(&self, id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let row: Option<(String, Option<i64>, Option<String>, String)> = conn
+            .query_row(
+                "SELECT install_hash, cluster_id, app_version, raw FROM reports WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((install, cluster, version, raw)) = row else {
+            return Ok(false);
+        };
+        let tx = conn.unchecked_transaction()?;
+        Self::detach(&tx, id, cluster, &install, version.as_deref(), &raw)?;
+        tx.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Ban the install that sent report `id`; returns false if unknown.
+    pub fn ban_install_of_report(&self, id: i64, reason: &str, at: u64) -> Result<bool> {
+        let conn = self.conn();
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT install_hash FROM reports WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(hash) = hash else {
+            return Ok(false);
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO bans (install_hash, reason, banned_at) VALUES (?1, ?2, ?3)",
+            params![
+                hash,
+                reason.chars().take(200).collect::<String>(),
+                at as i64
+            ],
+        )?;
+        Ok(true)
+    }
+
+    pub fn is_banned(&self, install_hash: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM bans WHERE install_hash = ?1",
+                params![install_hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn ban_count(&self) -> Result<usize> {
+        Ok(self
+            .conn()
+            .query_row("SELECT count(*) FROM bans", [], |r| r.get::<_, i64>(0))?
+            as usize)
     }
 
     /// Test hook: overwrite a cluster's fingerprint to simulate older rules.

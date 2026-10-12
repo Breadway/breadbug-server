@@ -46,6 +46,8 @@ pub struct Config {
     /// Name recorded with vectors from `embed_url`, so a model change forces
     /// a re-embed instead of mixing vector spaces.
     pub embed_model: String,
+    /// Optional TOML with severity rule overrides (see `triage::ScoreRules`).
+    pub triage_rules: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -67,6 +69,7 @@ impl Default for Config {
             fuzzy_threshold: 0.30,
             embed_url: None,
             embed_model: "default".to_string(),
+            triage_rules: None,
         }
     }
 }
@@ -136,6 +139,7 @@ impl Config {
                 c.embed_model = v.trim().to_string();
             }
         }
+        c.triage_rules = env_parse::<PathBuf>("BREADBUG_TRIAGE_RULES")?;
         if let Some(v) = env_parse::<PathBuf>("BREADBUG_SYMBOL_DIR")? {
             c.symbol_dir = Some(v);
         }

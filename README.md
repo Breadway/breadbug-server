@@ -17,6 +17,23 @@ triage inbox.
 The wire format is schema 1; see `src/schema.rs` and
 `tests/fixtures/report_v1.json`.
 
+## Triage inbox (admin listener, port 8121)
+
+Set `BREADBUG_ADMIN_TOKEN_SHA256` (hex SHA-256 of a long random token) to enable
+the admin UI on its own listener; never route it publicly. Sign in at
+`/admin/login`, or send `Authorization: Bearer <token>`. Cookie sessions are
+HttpOnly, SameSite=Strict, and every POST needs the page's CSRF token. The UI
+sends a CSP with no scripts and escapes every value from a report.
+
+* **Inbox**: clusters ranked by an explainable score (kind, volume, distinct
+  installs, recency, version spread; tune with `BREADBUG_TRIAGE_RULES`).
+* **Cluster page**: score breakdown, versions and OS builds, the latest
+  reports' notes, messages and stacks; set status, mark fixed in a version,
+  merge a duplicate cluster into this one.
+* **Quarantine**: reports the server's scrub found something in; release,
+  delete, or delete and ban the install.
+* **Missing symbols**: build-ids the symbol store lacks.
+
 ## Running
 
 ```sh

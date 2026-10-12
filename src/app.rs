@@ -23,6 +23,7 @@ use crate::ratelimit::Limiter;
 use crate::rescrub::rescrub;
 use crate::schema::Report;
 use crate::symbolicate::SymbolStore;
+use crate::triage::ScoreRules;
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -36,9 +37,31 @@ pub struct AppState {
     in_flight: Arc<Semaphore>,
     symbols: SymbolStore,
     embedder: Box<dyn Embedder>,
+    rules: ScoreRules,
+    login: Limiter,
 }
 
 impl AppState {
+    pub(crate) fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
+    pub(crate) fn login_limiter(&self) -> &Limiter {
+        &self.login
+    }
+
+    pub fn rules(&self) -> &ScoreRules {
+        &self.rules
+    }
+
+    /// Fuzzy-matching settings for clustering.
+    pub fn fuzzy(&self) -> Fuzzy<'_> {
+        Fuzzy {
+            embedder: self.embedder.as_ref(),
+            threshold: self.cfg.fuzzy_threshold,
+        }
+    }
+
     pub fn new(cfg: Config, db: Db, secret: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
             per_install: Limiter::new(cfg.per_install_per_hour, HOUR),
@@ -47,10 +70,22 @@ impl AppState {
             in_flight: Arc::new(Semaphore::new(cfg.max_in_flight)),
             symbols: SymbolStore::new(cfg.symbols_path()),
             embedder: make_embedder(&cfg),
+            rules: load_rules(&cfg),
+            login: Limiter::new(10, Duration::from_secs(600)),
             cfg,
             db: Arc::new(db),
             secret,
         })
+    }
+}
+
+fn load_rules(cfg: &Config) -> ScoreRules {
+    match &cfg.triage_rules {
+        Some(path) => ScoreRules::load(path).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "triage rules unreadable; using defaults");
+            ScoreRules::default()
+        }),
+        None => ScoreRules::default(),
     }
 }
 
@@ -174,6 +209,21 @@ async fn post_report(State(s): State<Arc<AppState>>, request: Request) -> Respon
     if body.is_empty() {
         return err(StatusCode::BAD_REQUEST, "empty body");
     }
+    {
+        let db = s.db.clone();
+        let hash = install_hash.clone();
+        match tokio::task::spawn_blocking(move || db.is_banned(&hash)).await {
+            Ok(Ok(true)) => return err(StatusCode::FORBIDDEN, "blocked"),
+            Ok(Ok(false)) => {}
+            _ => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not check the request",
+                )
+            }
+        }
+    }
+
     if let Err(e) = Report::parse(&body, now_unix()) {
         return err(StatusCode::BAD_REQUEST, &e);
     }
