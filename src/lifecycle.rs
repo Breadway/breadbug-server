@@ -64,6 +64,32 @@ fn one_line(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// Display name for a cluster kind in filed issues.
+fn kind_name(kind: &str) -> &'static str {
+    match kind {
+        "manual" => "manual bug report",
+        "request" => "feature request",
+        _ => match kind {
+            "crash" => "crash",
+            "freeze" => "freeze",
+            _ => "behavior",
+        },
+    }
+}
+
+/// How a kind was found, for the issue body.
+fn found_by(kind: &str) -> &'static str {
+    match kind {
+        "manual" => {
+            "a user-filed manual bug report (written by the user, scrubbed client-side and server-side)"
+        }
+        "request" => {
+            "a user-filed feature request (written by the user, scrubbed client-side and server-side)"
+        }
+        _ => "opt-in user bug reports (scrubbed client-side and server-side)",
+    }
+}
+
 /// The issue body: how it was found, confidence, and what the bug is.
 pub fn issue_body(c: &ClusterRow, samples: &[String], cluster_url: Option<&str>) -> String {
     let versions = c
@@ -80,11 +106,14 @@ pub fn issue_body(c: &ClusterRow, samples: &[String], cluster_url: Option<&str>)
         .join(", ");
     let mut b = String::new();
     b.push_str("Filed from the breadbug triage inbox.\n\n");
-    b.push_str("**How it was found:** opt-in user bug reports (scrubbed client-side and server-side), grouped by breadbug-server.\n\n");
+    b.push_str(&format!(
+        "**How it was found:** {}, grouped by breadbug-server.\n\n",
+        found_by(&c.kind)
+    ));
     b.push_str(&format!("**Confidence:** {}.\n\n", confidence(c)));
     b.push_str(&format!(
         "**What it is:** a {} in `{}`: {} report(s) from {} install(s), first seen {}, last seen {}.\n\n",
-        c.kind,
+        kind_name(&c.kind),
         c.app,
         c.count,
         c.installs,
@@ -124,6 +153,12 @@ pub fn evidence(raw: &str) -> String {
         return String::new();
     };
     let mut lines: Vec<String> = Vec::new();
+    if let Some(t) = v["title"].as_str().filter(|t| !t.trim().is_empty()) {
+        lines.push(format!("title: {}", one_line(t, 200)));
+    }
+    if let Some(w) = v["want"].as_str().filter(|w| !w.trim().is_empty()) {
+        lines.push(format!("wants: {}", one_line(w, 300)));
+    }
     if let Some(m) = v["markers"].as_array().and_then(|m| m.last()) {
         if let Some(msg) = m["message"].as_str() {
             lines.push(format!(
@@ -292,8 +327,9 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
     Ok(())
 }
 
-/// Hourly: promoted clusters whose issue reached `done` are marked fixed.
-/// Returns how many changed.
+/// Hourly: clusters whose board issue reached `done` are marked fixed, and a
+/// cluster whose issue the board has reopened is returned to the promoted
+/// state. Returns how many changed.
 pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     let Some(board) = s.board() else {
         return Ok(0);
@@ -304,19 +340,23 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
             continue;
         };
         let Some(c) = s.db.cluster(id)? else { continue };
-        if state.status == "done" && c.status != "fixed" {
-            // Persist the board's fix version when it records one, so the
-            // public "fixed in" and the regression threshold use it. With no
-            // version, regression is judged against versions already seen
-            // (see `after_report`).
-            match state.fix_version {
-                Some(v) => {
-                    s.db.mark_fixed(id, &v)?;
-                }
-                None => {
-                    s.db.set_status(id, "fixed")?;
-                }
+        let live = matches!(
+            c.status.as_str(),
+            "promoted" | "regressed" | "investigating" | "new"
+        );
+        if state.status == "done" {
+            if live {
+                // Persist the board's fix version when it records one, and
+                // flag the state as board-driven so a later reopen re-derives
+                // it while an admin mark-fixed (which records a version) is
+                // left alone.
+                s.db.mark_fixed_from_board(id, state.fix_version.as_deref())?;
+                changed += 1;
             }
+        } else if c.status == "fixed" && c.board_fixed {
+            // The board moved a done issue back out of done, so re-derive the
+            // public state.
+            s.db.reopen_from_board(id)?;
             changed += 1;
         }
     }
