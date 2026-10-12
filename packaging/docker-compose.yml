@@ -23,8 +23,14 @@ services:
       BREADBUG_CLUSTER_URL: "${BREADBUG_CLUSTER_URL:-}"
       # sha256 of the admin bearer token; unset disables the admin UI
       BREADBUG_ADMIN_TOKEN_SHA256: "${BREADBUG_ADMIN_TOKEN_SHA256:-}"
+      # Promotion to breadboard issues; both unset disables it. Use a
+      # dedicated minimum-scope token, mounted as a file, never baked in.
+      BREADBUG_BOARD_URL: "${BREADBUG_BOARD_URL:-}"
+      BREADBUG_BOARD_TOKEN_FILE: "${BREADBUG_BOARD_TOKEN_FILE:-}"
     volumes:
       - breadbug-data:/data
+      # Debug symbols published by the release pipelines (ECO-67), read only.
+      - /srv/breadbug-symbols:/data/symbols:ro
     networks:
       - breadbug
     read_only: true
