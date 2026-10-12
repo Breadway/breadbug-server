@@ -203,6 +203,20 @@ const MIGRATIONS: &[&str] = &[
     // 6: promotion bookkeeping
     "ALTER TABLE clusters ADD COLUMN notified_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE clusters ADD COLUMN issue_priority TEXT;",
+    // 7: anonymous follows: one row per (cluster, install), token stored hashed
+    "CREATE TABLE follows (
+        id           INTEGER PRIMARY KEY,
+        cluster_id   INTEGER NOT NULL,
+        token_hash   TEXT NOT NULL UNIQUE,
+        install_hash TEXT NOT NULL,
+        created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX follows_cluster ON follows(cluster_id);
+    CREATE UNIQUE INDEX follows_one_per_install ON follows(cluster_id, install_hash);",
+    // 8: follow capability aliases: a merge can fold two follows into one
+    // cluster and both tokens must keep working, so more than one live token
+    // per install is allowed. Idempotency is handled by rotating in `follow`.
+    "DROP INDEX IF EXISTS follows_one_per_install;",
 ];
 
 impl Db {
@@ -402,6 +416,10 @@ impl Db {
         )?;
         conn.execute(
             "DELETE FROM cluster_installs WHERE cluster_id NOT IN (SELECT id FROM clusters)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM follows WHERE cluster_id NOT IN (SELECT id FROM clusters)",
             [],
         )?;
         Ok(n)
@@ -752,6 +770,14 @@ impl Db {
             "UPDATE reports SET cluster_id = ?2 WHERE cluster_id = ?1",
             params![from, into],
         )?;
+        // Follows move with the reports. An install following both clusters
+        // keeps both capability tokens (aliases): each one still reads and
+        // unsubscribes the folded follow instead of the source token being
+        // silently invalidated.
+        tx.execute(
+            "UPDATE follows SET cluster_id = ?2 WHERE cluster_id = ?1",
+            params![from, into],
+        )?;
         tx.execute(
             "UPDATE clusters SET merged_into = ?2, count = 0 WHERE id = ?1",
             params![from, into],
@@ -904,6 +930,19 @@ impl Db {
             params![id, fp],
         )?;
         Ok(())
+    }
+
+    /// Test hook: a report's row id for its receipt.
+    #[doc(hidden)]
+    pub fn report_id_for_test(&self, receipt: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Follow `merged_into` to the live cluster.
@@ -1082,6 +1121,64 @@ impl Db {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Follow a cluster. A fresh token replaces any earlier one for the same
+    /// install on this cluster, so a lost first response can be recovered by
+    /// retrying (the retry returns a usable token). Returns whether an
+    /// earlier follow was replaced.
+    pub fn follow(
+        &self,
+        cluster_id: i64,
+        token_hash: &str,
+        install_hash: &str,
+        at: u64,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let replaced = tx.execute(
+            "DELETE FROM follows WHERE cluster_id = ?1 AND install_hash = ?2",
+            params![cluster_id, install_hash],
+        )? > 0;
+        tx.execute(
+            "INSERT INTO follows (cluster_id, token_hash, install_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![cluster_id, token_hash, install_hash, at as i64],
+        )?;
+        tx.commit()?;
+        Ok(replaced)
+    }
+
+    /// Stop following. Returns false for an unknown token.
+    pub fn unfollow(&self, token_hash: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM follows WHERE token_hash = ?1",
+            params![token_hash],
+        )? > 0)
+    }
+
+    /// How many installs follow a cluster (a merge can leave an install with
+    /// more than one live token, so count distinct installs).
+    pub fn follow_count(&self, cluster_id: i64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT count(DISTINCT install_hash) FROM follows WHERE cluster_id = ?1",
+            params![cluster_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// Whether `token_hash` is the deletion token of the report with this
+    /// receipt. Used to authenticate the reporter for follow.
+    pub fn deletion_token_matches(&self, receipt: &str, token_hash: &str) -> Result<bool> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT token_hash FROM reports WHERE receipt = ?1",
+                params![receipt],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored.is_some_and(|s| ct_eq(&s, token_hash)))
     }
 
     /// Fold the WAL back and reclaim freed pages so deleted data really
