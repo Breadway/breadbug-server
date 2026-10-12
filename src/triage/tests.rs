@@ -17,6 +17,7 @@ fn cluster(kind: &str, count: u64, installs: u64, last_seen: u64) -> ClusterRow 
         os_builds: BTreeMap::new(),
         fixed_in: None,
         issue_key: None,
+        issue_status: None,
         merged_into: None,
         board_fixed: false,
     }

@@ -34,6 +34,59 @@ pub type MissingSymbols = (String, String, Option<String>, u64);
 pub struct PublicStatus {
     pub status: &'static str,
     pub fixed_in: Option<String>,
+    /// Development progress from the linked breadboard issue, if any. This
+    /// is a coarse stage name only; no board internals ever leave the server.
+    ///
+    /// Mapping (breadboard is authoritative, this is a cached view):
+    ///
+    /// | cluster / board state | progress |
+    /// |---|---|
+    /// | cluster `dismissed` | `declined` |
+    /// | cluster `deferred` | `deferred` |
+    /// | issue `done` | `completed` |
+    /// | issue `review` | `fixed` |
+    /// | cluster `fixed` with a recorded version | `targeting_release` |
+    /// | cluster `fixed` without a version | `fixed` |
+    /// | issue `backlog` or `todo` | `accepted` |
+    /// | issue `doing` | `in_development` |
+    pub progress: Option<String>,
+}
+
+/// Development progress for a cluster row. See [`PublicStatus::progress`]
+/// for the mapping table. Cluster verdicts take precedence, then a completed
+/// board issue, then the cluster's own fixed state, then the remaining board
+/// stages.
+pub fn progress_of(c: &ClusterRow) -> Option<&'static str> {
+    match c.status.as_str() {
+        "dismissed" => return Some("declined"),
+        "deferred" => return Some("deferred"),
+        _ => {}
+    }
+    let linked = c.issue_key.as_deref().filter(|k| *k != "pending");
+    if linked.is_some() {
+        match c.issue_status.as_deref() {
+            Some("done") => return Some("completed"),
+            Some("review") => return Some("fixed"),
+            _ => {}
+        }
+    }
+    if c.status == "fixed" {
+        // A recorded fix version names the release the fix targets; with no
+        // version the fix is implemented but not yet aimed at a release.
+        return Some(if c.fixed_in.is_some() {
+            "targeting_release"
+        } else {
+            "fixed"
+        });
+    }
+    if linked.is_some() {
+        match c.issue_status.as_deref() {
+            Some("backlog") | Some("todo") => return Some("accepted"),
+            Some("doing") => return Some("in_development"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A report shown as evidence in the triage view.
@@ -65,7 +118,11 @@ pub const STATUSES: &[&str] = &[
     "promoted",
     "fixed",
     "regressed",
+    "deferred",
 ];
+
+/// Board statuses we cache per promoted cluster. Anything else is ignored.
+pub const KNOWN_ISSUE_STATUSES: &[&str] = &["backlog", "todo", "doing", "review", "done"];
 
 /// `(cluster id, centroid, reports folded into it)`.
 pub type FuzzyCandidate = (i64, Vec<f32>, u64);
@@ -105,6 +162,7 @@ pub struct ClusterRow {
     pub os_builds: std::collections::BTreeMap<String, u64>,
     pub fixed_in: Option<String>,
     pub issue_key: Option<String>,
+    pub issue_status: Option<String>,
     /// Whether the fixed state came from the board reaching `done` (so a
     /// board reopen should re-derive it), as opposed to an admin mark-fixed.
     pub board_fixed: bool,
@@ -223,6 +281,8 @@ const MIGRATIONS: &[&str] = &[
     // 9: remember that a cluster's fixed state came from the board, so a
     // board reopen re-derives it while an admin "mark fixed" is left alone.
     "ALTER TABLE clusters ADD COLUMN board_fixed INTEGER NOT NULL DEFAULT 0;",
+    // 10: cached breadboard issue status for the public progress stage
+    "ALTER TABLE clusters ADD COLUMN issue_status TEXT;",
 ];
 
 impl Db {
@@ -507,6 +567,7 @@ impl Db {
         let received = PublicStatus {
             status: "received",
             fixed_in: None,
+            progress: None,
         };
         let (Some(cid), 0) = (cluster, quarantined) else {
             return Ok(Some(received));
@@ -515,23 +576,33 @@ impl Db {
         let Some(c) = Self::cluster_from(&conn, cid)? else {
             return Ok(Some(received));
         };
+        let progress = progress_of(&c).map(str::to_string);
         Ok(Some(match c.status.as_str() {
             "promoted" | "investigating" | "regressed" => PublicStatus {
                 status: "investigating",
                 fixed_in: None,
+                progress,
             },
             "fixed" => PublicStatus {
                 status: "fixed",
                 fixed_in: c.fixed_in,
+                progress,
             },
             "dismissed" => PublicStatus {
                 status: "closed",
                 fixed_in: None,
+                progress,
+            },
+            "deferred" => PublicStatus {
+                status: "investigating",
+                fixed_in: None,
+                progress,
             },
             // A known problem others have already reported.
             _ if c.count > 1 => PublicStatus {
                 status: "duplicate",
                 fixed_in: None,
+                progress,
             },
             _ => received,
         }))
@@ -692,7 +763,10 @@ impl Db {
         Ok(())
     }
 
-    /// `(cluster id, issue key)` for every cluster tracking an issue.
+    /// `(cluster id, issue key)` for every cluster tracking an issue. This
+    /// includes fixed, dismissed and deferred groups: their board issue can
+    /// still move, and a fixed cluster whose issue reopens must be re-derived
+    /// rather than frozen.
     pub fn tracked_issues(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -712,6 +786,18 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             params![id],
             |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
         )?)
+    }
+
+    /// Cache the linked breadboard issue's workflow status for the public
+    /// progress stage. Unknown values are ignored; returns false then.
+    pub fn set_issue_status(&self, id: i64, status: &str) -> Result<bool> {
+        if !KNOWN_ISSUE_STATUSES.contains(&status) {
+            return Ok(false);
+        }
+        Ok(self.conn().execute(
+            "UPDATE clusters SET issue_status = ?2 WHERE id = ?1 AND merged_into IS NULL",
+            params![id, status],
+        )? > 0)
     }
 
     pub fn mark_fixed(&self, id: i64, version: &str) -> Result<bool> {
@@ -1089,7 +1175,7 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             .query_row(
                 "SELECT c.id, c.app, c.kind, c.fingerprint, c.title, c.status, c.first_seen,
                         c.last_seen, c.count, c.versions, c.os_builds, c.fixed_in, c.issue_key,
-                        c.board_fixed, c.merged_into,
+                        c.issue_status, c.board_fixed, c.merged_into,
                         (SELECT count(*) FROM cluster_installs i WHERE i.cluster_id = c.id)
                  FROM clusters c WHERE c.id = ?1",
                 params![id],
@@ -1110,9 +1196,10 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
                         os_builds: serde_json::from_str(&os_builds).unwrap_or_default(),
                         fixed_in: r.get(11)?,
                         issue_key: r.get(12)?,
-                        board_fixed: r.get(13)?,
-                        merged_into: r.get(14)?,
-                        installs: r.get::<_, i64>(15)? as u64,
+                        issue_status: r.get(13)?,
+                        board_fixed: r.get(14)?,
+                        merged_into: r.get(15)?,
+                        installs: r.get::<_, i64>(16)? as u64,
                     })
                 },
             )

@@ -329,7 +329,8 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
 
 /// Hourly: clusters whose board issue reached `done` are marked fixed, and a
 /// cluster whose issue the board has reopened is returned to the promoted
-/// state. Returns how many changed.
+/// state. The issue's workflow status is cached on every pass so the public
+/// progress stage stays current. Returns how many changed.
 pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     let Some(board) = s.board() else {
         return Ok(0);
@@ -339,6 +340,7 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
         let Ok(state) = board.issue_state(&key) else {
             continue;
         };
+        let _ = s.db.set_issue_status(id, &state.status);
         let Some(c) = s.db.cluster(id)? else { continue };
         let live = matches!(
             c.status.as_str(),

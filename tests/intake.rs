@@ -757,12 +757,18 @@ async fn public_status_follows_the_cluster_and_reveals_nothing_else() {
     h.state.db.mark_fixed(cid, "0.4.0").unwrap();
     assert_eq!(
         status_of(&h, rec1.clone()).await.1,
-        json!({"status": "fixed", "fixed_in": "0.4.0"})
+        json!({"status": "fixed", "fixed_in": "0.4.0", "progress": "targeting_release"})
     );
     h.state.db.set_status(cid, "dismissed").unwrap();
     assert_eq!(
         status_of(&h, rec1.clone()).await.1,
-        json!({"status": "closed"})
+        json!({"status": "closed", "progress": "declined"})
+    );
+    // parking the cluster reads deferred while staying open
+    h.state.db.set_status(cid, "deferred").unwrap();
+    assert_eq!(
+        status_of(&h, rec1.clone()).await.1,
+        json!({"status": "investigating", "progress": "deferred"})
     );
 
     // merged clusters report their target's state
