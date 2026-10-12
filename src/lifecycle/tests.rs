@@ -83,3 +83,61 @@ fn evidence_is_compact_and_flat() {
     assert!(e.contains("user note: it broke badly"));
     assert_eq!(evidence("not json"), "");
 }
+
+#[test]
+fn notice_text_names_app_version_and_stage_per_kind() {
+    use crate::db::ClusterRow;
+    let mut c = ClusterRow {
+        id: 1,
+        app: "bar".into(),
+        kind: "crash".into(),
+        fingerprint: None,
+        title: "t".into(),
+        status: "promoted".into(),
+        first_seen: 0,
+        last_seen: 0,
+        count: 2,
+        installs: 2,
+        versions: Default::default(),
+        os_builds: Default::default(),
+        fixed_in: None,
+        issue_key: None,
+        issue_status: None,
+        board_fixed: false,
+        target_beta: None,
+        confirmed_beta: None,
+        target_stable: None,
+        confirmed_stable: None,
+        merged_into: None,
+    };
+    assert_eq!(
+        super::notice_text(&c, "fixed", Some("1.3.0")),
+        "A bug you follow in bar has been fixed in 1.3.0. Thanks for helping us improve it!"
+    );
+    assert_eq!(
+        super::notice_text(&c, "beta", Some("1.4-beta1")),
+        "A bug you follow in bar is available in the 1.4-beta1 beta."
+    );
+    assert_eq!(
+        super::notice_text(&c, "stable", Some("1.4")),
+        "A bug you follow in bar is available in 1.4 stable."
+    );
+    c.kind = "request".into();
+    assert_eq!(
+        super::notice_text(&c, "fixed", Some("2.0")),
+        "A feature you follow in bar has been implemented in 2.0. Thanks for helping us improve it!"
+    );
+    assert_eq!(
+        super::notice_text(&c, "stable", Some("2.0")),
+        "A feature you follow in bar is available in 2.0 stable."
+    );
+    // Board-detected fixes carry no version: still names the app and stage.
+    assert_eq!(
+        super::notice_text(&c, "fixed", None),
+        "A feature you follow in bar has been implemented. Thanks for helping us improve it!"
+    );
+    assert_eq!(
+        super::notice_text(&c, "beta", None),
+        "A feature you follow in bar is available in the beta channel."
+    );
+}

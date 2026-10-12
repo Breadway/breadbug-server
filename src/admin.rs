@@ -629,7 +629,21 @@ async fn mark_fixed(
         );
     }
     let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.mark_fixed(id, &version)).await {
+    let wake = s.notice_wake().clone();
+    match tokio::task::spawn_blocking(move || {
+        let Some(c) = db.cluster(id)? else {
+            return anyhow::Ok(false);
+        };
+        let text = crate::lifecycle::notice_text(&c, "fixed", Some(&version));
+        let changed =
+            db.mark_fixed_and_notify(id, Some(&version), "fixed", &text, crate::app::now_unix())?;
+        if changed {
+            let _ = wake.send(());
+        }
+        anyhow::Ok(changed)
+    })
+    .await
+    {
         Ok(Ok(true)) => back_to(id),
         Ok(Ok(false)) => notice(StatusCode::BAD_REQUEST, "Unknown cluster."),
         _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not update."),
@@ -717,8 +731,26 @@ async fn mark_release_confirmed(
         );
     };
     let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.mark_release_confirmed(id, &channel, &version))
-        .await
+    let wake = s.notice_wake().clone();
+    match tokio::task::spawn_blocking(move || {
+        let Some(c) = db.cluster(id)? else {
+            return anyhow::Ok(false);
+        };
+        let text = crate::lifecycle::notice_text(&c, &channel, Some(&version));
+        let changed = db.confirm_and_notify(
+            id,
+            &channel,
+            &version,
+            &channel,
+            &text,
+            crate::app::now_unix(),
+        )?;
+        if changed {
+            let _ = wake.send(());
+        }
+        anyhow::Ok(changed)
+    })
+    .await
     {
         Ok(Ok(true)) => back_to(id),
         Ok(Ok(false)) => notice(

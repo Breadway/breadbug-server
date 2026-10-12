@@ -41,11 +41,18 @@ pub struct AppState {
     rules: ScoreRules,
     login: Limiter,
     board: Option<BoardClient>,
+    /// Wakes waiters (the long-poll notice endpoint) when a notice is queued.
+    notice_wake: tokio::sync::broadcast::Sender<()>,
 }
 
 impl AppState {
     pub(crate) fn secret(&self) -> &[u8] {
         &self.secret
+    }
+
+    /// Wakes the notice waiters when new notices are queued.
+    pub fn notice_wake(&self) -> &tokio::sync::broadcast::Sender<()> {
+        &self.notice_wake
     }
 
     pub(crate) fn login_limiter(&self) -> &Limiter {
@@ -79,6 +86,7 @@ impl AppState {
             rules: load_rules(&cfg),
             login: Limiter::new(10, Duration::from_secs(600)),
             board: make_board(&cfg),
+            notice_wake: tokio::sync::broadcast::channel(64).0,
             cfg,
             db: Arc::new(db),
             secret,
@@ -146,6 +154,9 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         .route("/v1/reports/{receipt}/status", get(report_status))
         .route("/v1/reports/{receipt}/follow", post(follow_report))
         .route("/v1/follows/{token}", delete(unfollow))
+        .route("/v1/follows/{token}/notifications", get(follow_notices))
+        .route("/v1/follows/{token}/notifications/ack", post(ack_notices))
+        .route("/v1/follows/{token}/notifications/wait", get(wait_notices))
         .layer(DefaultBodyLimit::max(state.cfg.max_body_bytes))
         .with_state(state)
 }
@@ -634,6 +645,140 @@ async fn unfollow(
         Ok(Ok(false)) => err(StatusCode::NOT_FOUND, "not found"),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
     }
+}
+
+/// Read a follow's pending notifications without consuming them. Each notice
+/// has a stable id; the client acks the ids it has handled through the ack
+/// endpoint, so a lost response never drops a notice. Unknown tokens are 404,
+/// like unfollow.
+async fn follow_notices(
+    State(s): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        if !db.has_follow(&token_hash)? {
+            return anyhow::Ok(None);
+        }
+        Ok(Some(db.notices_for(&token_hash)?))
+    })
+    .await
+    {
+        Ok(Ok(Some(notices))) => Json(json!({ "notices": notices_json(notices) })).into_response(),
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AckBody {
+    ids: Vec<i64>,
+}
+
+/// Acknowledge notices by id so they stop being pending. This is the durable
+/// half of delivery: nothing is marked delivered until the client says it has
+/// the notice, and only the caller's own follow token can ack.
+async fn ack_notices(
+    State(s): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<AckBody>,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if body.ids.len() > 256 {
+        return err(StatusCode::BAD_REQUEST, "too many ids");
+    }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    let ids = body.ids;
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        if !db.has_follow(&token_hash)? {
+            return anyhow::Ok(None);
+        }
+        Ok(Some(db.ack_notices(&token_hash, &ids)?))
+    })
+    .await
+    {
+        Ok(Ok(Some(n))) => Json(json!({ "acked": n })).into_response(),
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    }
+}
+
+/// Long-poll for a follow's pending notifications: this is the no-client-poll
+/// channel. The request is held until a notice is queued for this follow or
+/// the wait times out, then the pending notices are returned, not consumed.
+/// Clients ack them with the ack endpoint. Unknown tokens are 404.
+async fn wait_notices(
+    State(s): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if let Err(wait) = s
+        .per_network
+        .check(network_key(&s, &headers), Instant::now())
+    {
+        return too_many(wait);
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    {
+        let db = s.db.clone();
+        let hash = token_hash.clone();
+        match tokio::task::spawn_blocking(move || db.has_follow(&hash)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return err(StatusCode::NOT_FOUND, "not found"),
+            _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+        }
+    }
+    let mut wake = s.notice_wake().subscribe();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let db = s.db.clone();
+        let hash = token_hash.clone();
+        match tokio::task::spawn_blocking(move || db.notices_for(&hash)).await {
+            Ok(Ok(notices)) if !notices.is_empty() => {
+                return Json(json!({ "notices": notices_json(notices) })).into_response()
+            }
+            Ok(Ok(_)) => {}
+            _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || tokio::time::timeout(remaining, wake.recv()).await.is_err() {
+            // Nothing was queued in time: an empty list lets the client simply
+            // reissue the wait.
+            return Json(json!({ "notices": [] })).into_response();
+        }
+    }
+}
+
+/// Render notices for the wire: stable id, event, text, timestamp.
+fn notices_json(notices: Vec<crate::db::Notice>) -> Vec<Value> {
+    notices
+        .into_iter()
+        .map(|n| json!({ "id": n.id, "event": n.event, "text": n.text, "at": n.created_at }))
+        .collect()
 }
 
 /// One maintenance pass: retention, then compaction.

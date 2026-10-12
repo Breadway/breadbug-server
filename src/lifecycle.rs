@@ -359,6 +359,51 @@ pub fn after_report(s: &AppState, cluster_id: i64, report_version: Option<&str>)
 /// cluster whose issue the board has reopened is returned to the promoted
 /// state. The issue's workflow status is cached on every pass so the public
 /// progress stage stays current. Returns how many changed.
+/// User-facing notice text for a cluster transition. Names the application
+/// and version, and says which stage was reached: fixed in development, out
+/// in beta, or available in stable.
+pub fn notice_text(c: &ClusterRow, event: &str, version: Option<&str>) -> String {
+    let (thing, done) = match c.kind.as_str() {
+        "request" => ("A feature you follow", "has been implemented"),
+        _ => ("A bug you follow", "has been fixed"),
+    };
+    // Always name the app and the stage, even when no version is known yet.
+    match (event, version) {
+        ("beta", Some(v)) => format!("{thing} in {} is available in the {v} beta.", c.app),
+        ("beta", None) => format!("{thing} in {} is available in the beta channel.", c.app),
+        ("stable", Some(v)) => format!("{thing} in {} is available in {v} stable.", c.app),
+        ("stable", None) => format!("{thing} in {} is available in the stable channel.", c.app),
+        (_, Some(v)) => format!(
+            "{thing} in {} {done} in {v}. Thanks for helping us improve it!",
+            c.app
+        ),
+        (_, None) => format!(
+            "{thing} in {} {done}. Thanks for helping us improve it!",
+            c.app
+        ),
+    }
+}
+
+/// Queue notices for every follow of a cluster. Failures are returned for
+/// logging and never affect the admin action or intake.
+pub fn notify(
+    c: &ClusterRow,
+    db: &crate::db::Db,
+    event: &str,
+    version: Option<&str>,
+) -> Result<usize> {
+    db.notify_follows(
+        c.id,
+        event,
+        &notice_text(c, event, version),
+        crate::app::now_unix(),
+    )
+}
+
+/// Hourly: clusters whose board issue reached `done` are marked fixed, and a
+/// cluster whose issue the board has reopened is returned to the promoted
+/// state. The issue's workflow status is cached on every pass so the public
+/// progress stage stays current. Returns how many changed.
 pub fn sync_issue_states(s: &AppState) -> Result<usize> {
     let Some(board) = s.board() else {
         return Ok(0);
@@ -376,11 +421,19 @@ pub fn sync_issue_states(s: &AppState) -> Result<usize> {
         );
         if state.status == "done" {
             if live {
-                // Persist the board's fix version when it records one, and
-                // flag the state as board-driven so a later reopen re-derives
-                // it while an admin mark-fixed (which records a version) is
-                // left alone.
-                s.db.mark_fixed_from_board(id, state.fix_version.as_deref())?;
+                // Persist the board's fix version when it records one, flag
+                // the state as board-driven so a later reopen re-derives it,
+                // and queue the notices in the same transaction so a crash
+                // cannot lose them.
+                let text = notice_text(&c, "fixed", state.fix_version.as_deref());
+                s.db.mark_fixed_from_board_and_notify(
+                    id,
+                    state.fix_version.as_deref(),
+                    "fixed",
+                    &text,
+                    crate::app::now_unix(),
+                )?;
+                let _ = s.notice_wake().send(());
                 changed += 1;
             }
         } else if c.status == "fixed" && c.board_fixed {
