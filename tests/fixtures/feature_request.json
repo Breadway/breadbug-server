@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "report_type": "request",
+  "created_unix": 1000,
+  "app": {
+    "id": "bar",
+    "version": "1.3.0"
+  },
+  "title": "Dark mode for the panel",
+  "want": "A dark theme option for the top panel.",
+  "notes": "I work night shifts and the bright panel hurts my eyes."
+}

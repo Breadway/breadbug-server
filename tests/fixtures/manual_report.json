@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "report_type": "manual",
+  "created_unix": 1000,
+  "app": {
+    "id": "bar",
+    "version": "1.3.0"
+  },
+  "title": "Panel flickers on workspace switch",
+  "notes": "The top panel flickers for about a second whenever I switch workspaces. No crash, the panel keeps working."
+}
