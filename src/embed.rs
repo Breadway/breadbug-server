@@ -210,6 +210,11 @@ pub fn from_bytes(b: &[u8]) -> Vec<f32> {
 pub fn report_text(r: &Report) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(r.report_type.as_str().to_string());
+    if let Some(t) = &r.title {
+        // A manual report's title names the problem: count it twice, like notes.
+        parts.push(t.clone());
+        parts.push(t.clone());
+    }
     if let Some(n) = &r.notes {
         // The user's own words are the strongest signal: count them twice.
         parts.push(n.clone());
@@ -245,9 +250,10 @@ pub fn report_text(r: &Report) -> String {
 /// A short title for a new fuzzy cluster.
 pub fn title_for(r: &Report) -> String {
     let basis = r
-        .notes
+        .title
         .as_deref()
-        .filter(|n| !n.trim().is_empty())
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| r.notes.as_deref().filter(|n| !n.trim().is_empty()))
         .or_else(|| r.markers.iter().find_map(|m| m.message.as_deref()))
         .or_else(|| {
             r.logs

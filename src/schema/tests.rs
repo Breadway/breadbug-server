@@ -101,3 +101,37 @@ fn app_id_rules() {
         assert!(!valid_app_id(bad), "{bad:?}");
     }
 }
+
+fn manual() -> Value {
+    json!({
+        "schema": 1,
+        "report_type": "manual",
+        "created_unix": 1000,
+        "app": { "id": "clip", "version": "0.3.1" },
+        "title": "Panel flickers on workspace switch",
+        "notes": "The top panel flickers for a second whenever I switch workspaces."
+    })
+}
+
+#[test]
+fn manual_report_needs_title_and_description() {
+    assert!(parse(&manual()).is_ok());
+    for (path, val) in [
+        ("title", json!(null)),
+        ("title", json!("   ")),
+        ("title", json!("x".repeat(MAX_TITLE + 1))),
+        ("notes", json!(null)),
+        ("notes", json!("  ")),
+    ] {
+        let mut v = manual();
+        v[path] = val;
+        assert!(parse(&v).is_err(), "{path}");
+    }
+}
+
+#[test]
+fn title_is_only_for_manual_reports() {
+    let mut v = minimal();
+    v["title"] = json!("sneaky");
+    assert!(parse(&v).is_err());
+}

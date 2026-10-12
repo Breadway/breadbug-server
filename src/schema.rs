@@ -14,6 +14,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 const MAX_STR: usize = 8 * 1024;
 const MAX_MSG: usize = 4 * 1024 + 256;
+const MAX_TITLE: usize = 256;
 const MAX_MARKERS: usize = 8;
 const MAX_FRAMES: usize = 128;
 const MAX_LOGS: usize = 1000;
@@ -30,6 +31,7 @@ pub enum ReportType {
     Crash,
     Freeze,
     Behavior,
+    Manual,
 }
 
 impl ReportType {
@@ -38,6 +40,7 @@ impl ReportType {
             Self::Crash => "crash",
             Self::Freeze => "freeze",
             Self::Behavior => "behavior",
+            Self::Manual => "manual",
         }
     }
 }
@@ -189,8 +192,23 @@ pub struct Report {
     pub journal: Vec<String>,
     #[serde(default)]
     pub live_stack: Vec<Frame>,
+    /// Short user-written title. Only manual reports may set this; automatic
+    /// reports keep their derived titles so clients cannot spoof clustering.
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Optional reference (a path or opaque id, never the bytes) to a
+    /// diagnostics bundle the user chose to attach. Requires `consent`.
+    #[serde(default)]
+    pub diagnostics_reference: Option<String>,
+    /// Optional reference to a screenshot the user chose to attach.
+    /// Requires `consent`.
+    #[serde(default)]
+    pub screenshot_reference: Option<String>,
+    /// The user's explicit consent to attach the optional diagnostics above.
+    #[serde(default)]
+    pub consent: bool,
     #[serde(default)]
     pub redactions: BTreeMap<String, usize>,
 }
@@ -346,6 +364,28 @@ impl Report {
             return Err("journal line is too long".into());
         }
         opt(&self.notes, MAX_STR, "notes")?;
+        opt(
+            &self.diagnostics_reference,
+            MAX_STR,
+            "diagnostics_reference",
+        )?;
+        opt(&self.screenshot_reference, MAX_STR, "screenshot_reference")?;
+        let attaching = self.diagnostics_reference.is_some() || self.screenshot_reference.is_some();
+        if attaching && !self.consent {
+            return Err("consent is required to attach diagnostics or a screenshot".into());
+        }
+        if self.report_type == ReportType::Manual {
+            match &self.title {
+                Some(t) if !t.trim().is_empty() && t.len() <= MAX_TITLE => {}
+                _ => return Err("manual reports need a short title".into()),
+            }
+            match &self.notes {
+                Some(n) if !n.trim().is_empty() => {}
+                _ => return Err("manual reports need a description in notes".into()),
+            }
+        } else if self.title.is_some() {
+            return Err("title is only for manual reports".into());
+        }
         list(
             &self.redactions.keys().collect::<Vec<_>>(),
             MAX_MAP,

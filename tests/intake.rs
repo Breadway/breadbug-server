@@ -804,3 +804,180 @@ async fn status_lookups_are_rate_limited() {
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 }
+
+// ---- manual reports -------------------------------------------------------
+
+fn manual_report(title: &str, notes: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema": 1,
+        "report_type": "manual",
+        "created_unix": 1000,
+        "app": {"id": "clip", "version": "0.3.1"},
+        "title": title,
+        "notes": notes,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn manual_reports_are_accepted_and_clustered_by_text() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    let title = "Panel flickers on workspace switch";
+    let a = manual_report(
+        title,
+        "The top panel flickers for a second on every switch.",
+    );
+    let b = manual_report(
+        title,
+        "Switching workspaces makes the top panel flicker briefly.",
+    );
+    let (s1, _, r1) = call(&h, post_as(&"1".repeat(32), &a)).await;
+    let (s2, _, r2) = call(&h, post_as(&"2".repeat(32), &b)).await;
+    assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED));
+    assert!(r1.get("deletion_token").is_some());
+    // Idempotent resend of the same body from the same install.
+    let (s3, _, again) = call(&h, post_as(&"1".repeat(32), &a)).await;
+    assert_eq!(s3, StatusCode::OK);
+    assert_eq!(again["receipt"], r1["receipt"]);
+    // Both installs describe the same problem: one cluster, titled as filed.
+    let c1 = h
+        .state
+        .db
+        .cluster_of(r1["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let c2 = h
+        .state
+        .db
+        .cluster_of(r2["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(c1, c2);
+    let cluster = h.state.db.cluster(c1).unwrap().unwrap();
+    assert_eq!(cluster.kind, "manual");
+    assert_eq!(cluster.title, title);
+    assert_eq!((cluster.count, cluster.installs), (2, 2));
+}
+
+#[tokio::test]
+async fn manual_reports_without_title_or_description_are_rejected() {
+    let h = harness(|_| {});
+    for body in [
+        manual_report("", "has words but no title here"),
+        manual_report("A title with no description", "   "),
+        serde_json::to_vec(&json!({
+            "schema": 1, "report_type": "manual", "created_unix": 1000,
+            "app": {"id": "clip"}, "notes": "no title at all in this one",
+        }))
+        .unwrap(),
+    ] {
+        let (status, _, _) = call(&h, post_as(&"1".repeat(32), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn leaked_pii_in_a_manual_title_is_scrubbed_and_quarantined() {
+    let h = harness(|_| {});
+    let body = manual_report(
+        "Breaks for leak@example.org",
+        "Contact me at leak@example.org about this",
+    );
+    let (status, _, r) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let receipt = r["receipt"].as_str().unwrap();
+    let raw = h.state.db.raw_of(receipt).unwrap().unwrap();
+    assert!(!raw.contains("leak@example.org"));
+    assert_eq!(h.state.db.is_quarantined(receipt).unwrap(), Some(true));
+}
+
+#[tokio::test]
+async fn manual_diagnostics_and_screenshot_need_consent() {
+    let h = harness(|c| c.per_install_per_hour = 100);
+    // A reference without consent is refused.
+    let body = serde_json::to_vec(&json!({
+        "schema": 1, "report_type": "manual", "created_unix": 1000,
+        "app": {"id": "clip", "version": "0.3"},
+        "title": "Panel flickers",
+        "notes": "The panel flickers on every workspace switch today.",
+        "diagnostics_reference": "diag/2026-10-11",
+    }))
+    .unwrap();
+    let (s, _, _) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+
+    // With consent, both references are accepted and stored.
+    let body = serde_json::to_vec(&json!({
+        "schema": 1, "report_type": "manual", "created_unix": 1000,
+        "app": {"id": "clip", "version": "0.3"},
+        "title": "Panel flickers",
+        "notes": "The panel flickers on every workspace switch today.",
+        "diagnostics_reference": "diag/2026-10-11",
+        "screenshot_reference": "shot/42",
+        "consent": true,
+    }))
+    .unwrap();
+    let (s, _, r) = call(&h, post_as(&"1".repeat(32), &body)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let raw = h
+        .state
+        .db
+        .raw_of(r["receipt"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(
+        raw.contains("diag/2026-10-11") && raw.contains("shot/42"),
+        "{raw}"
+    );
+}
+
+#[tokio::test]
+async fn manual_reports_respect_rate_limit_and_delete() {
+    let h = harness(|c| c.per_install_per_hour = 1);
+    let a = manual_report(
+        "Panel flickers",
+        "The panel flickers on every switch today.",
+    );
+    let b = manual_report(
+        "Clipboard lost",
+        "The clipboard contents vanish after unlock.",
+    );
+    let (s1, _, r1) = call(&h, post_as(&"1".repeat(32), &a)).await;
+    assert_eq!(s1, StatusCode::CREATED);
+    let (s2, hdr, _) = call(&h, post_as(&"1".repeat(32), &b)).await;
+    assert_eq!(s2, StatusCode::TOO_MANY_REQUESTS);
+    assert!(hdr.contains_key("retry-after"), "{hdr:?}");
+
+    let receipt = r1["receipt"].as_str().unwrap().to_string();
+    let token = r1["deletion_token"].as_str().unwrap().to_string();
+    let del = |tok: &str| {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/reports/{receipt}"))
+            .header("authorization", format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        call(&h, del(&"0".repeat(64))).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.state.db.report_count().unwrap(), 1);
+    assert_eq!(call(&h, del(&token)).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn manual_reports_are_covered_by_retention() {
+    let h = harness(|c| c.retention = std::time::Duration::from_secs(0));
+    let body = manual_report(
+        "Panel flickers",
+        "The panel flickers on every switch today.",
+    );
+    call(&h, post_as(&"1".repeat(32), &body)).await;
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(maintain(&h.state).unwrap(), 1);
+    assert_eq!(h.state.db.report_count().unwrap(), 0);
+}

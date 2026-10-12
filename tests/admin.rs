@@ -548,3 +548,33 @@ async fn missing_symbols_page_lists_build_ids() {
     let r = admin(&h, get("/admin/symbols")).await;
     assert!(r.body.contains("aabbccddeeff0011"));
 }
+
+#[tokio::test]
+async fn inbox_kind_filter_separates_manual_from_crashes() {
+    let h = harness(true);
+    public_post(
+        &h,
+        &"1".repeat(32),
+        &crash("clip::a", "a crash happened", "clip", "0.3"),
+    )
+    .await;
+    public_post(
+        &h,
+        &"2".repeat(32),
+        &json!({
+            "schema": 1, "report_type": "manual", "created_unix": 1,
+            "app": {"id": "clip", "version": "0.3"},
+            "title": "Panel flickers on switch",
+            "notes": "The panel flickers whenever I switch workspaces today.",
+        }),
+    )
+    .await;
+
+    let crashes = admin(&h, get("/admin/?status=all&kind=crash")).await.body;
+    assert!(crashes.contains("a crash happened"), "{crashes}");
+    assert!(!crashes.contains("Panel flickers on switch"), "{crashes}");
+
+    let manual = admin(&h, get("/admin/?status=all&kind=manual")).await.body;
+    assert!(manual.contains("Panel flickers on switch"), "{manual}");
+    assert!(!manual.contains("a crash happened"), "{manual}");
+}

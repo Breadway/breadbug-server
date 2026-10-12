@@ -235,6 +235,7 @@ async fn login_submit(State(s): State<Arc<AppState>>, Form(f): Form<LoginForm>) 
 struct InboxQuery {
     status: Option<String>,
     app: Option<String>,
+    kind: Option<String>,
 }
 
 fn score_of(s: &AppState, c: &ClusterRow) -> Score {
@@ -262,6 +263,11 @@ async fn inbox(
             other => c.status == other,
         })
         .filter(|c| q.app.as_deref().is_none_or(|a| a.is_empty() || c.app == a))
+        .filter(|c| {
+            q.kind
+                .as_deref()
+                .is_none_or(|k| k.is_empty() || c.kind == k)
+        })
         .map(|c| (score_of(&s, &c), c))
         .collect();
     rows.sort_by(|a, b| {
@@ -276,6 +282,10 @@ async fn inbox(
             body,
             "<a href=\"/admin/?status={f}\" class=\"tag\">{f}</a> "
         );
+    }
+    body.push_str("</p><p>kind:");
+    for k in ["crash", "freeze", "behavior", "manual", "request"] {
+        let _ = write!(body, "<a href=\"/admin/?kind={k}\" class=\"tag\">{k}</a> ");
     }
     body.push_str("</p><table><tr><th>score</th><th>problem</th><th>app</th><th>kind</th><th>reports</th><th>installs</th><th>versions</th><th>last seen</th><th>status</th></tr>");
     if rows.is_empty() {
