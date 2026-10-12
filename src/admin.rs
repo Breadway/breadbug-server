@@ -515,6 +515,34 @@ async fn detail(
             String::new()
         }
     );
+    fn channel_line(name: &str, planned: &Option<String>, confirmed: &Option<String>) -> String {
+        match (planned, confirmed) {
+            (None, None) => format!("{name}: not planned"),
+            (p, c) => format!(
+                "{name}: planned {}{}",
+                esc(p.as_deref().unwrap_or("?")),
+                c.as_deref()
+                    .map_or(String::from(" (not shipped)"), |v| format!(
+                        " (shipped {})",
+                        esc(v)
+                    ))
+            ),
+        }
+    }
+    let _ = write!(
+        b,
+        "<h2>Releases</h2><p>{} &middot; {}</p>\
+         <fieldset><legend>Plan</legend>\
+         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/release-target\">{csrf}<input type=\"hidden\" name=\"channel\" value=\"beta\"><input name=\"version\" placeholder=\"target beta\" size=\"12\"> <button>Set beta target</button></form> \
+         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/release-target\">{csrf}<input type=\"hidden\" name=\"channel\" value=\"stable\"><input name=\"version\" placeholder=\"target stable\" size=\"12\"> <button>Set stable target</button></form>\
+         </fieldset> \
+         <fieldset><legend>Confirm shipped</legend>\
+         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/release-confirmed\">{csrf}<input type=\"hidden\" name=\"channel\" value=\"beta\"><input name=\"version\" placeholder=\"shipped beta\" size=\"12\"> <button>Confirm beta</button></form> \
+         <form class=\"inline\" method=\"post\" action=\"/admin/clusters/{id}/release-confirmed\">{csrf}<input type=\"hidden\" name=\"channel\" value=\"stable\"><input name=\"version\" placeholder=\"shipped stable\" size=\"12\"> <button>Confirm stable</button></form>\
+         </fieldset>",
+        channel_line("beta", &c.target_beta, &c.confirmed_beta),
+        channel_line("stable", &c.target_stable, &c.confirmed_stable),
+    );
     let _ = write!(b, "<h2>Latest reports</h2>");
     for sm in &samples {
         let _ = write!(
@@ -546,6 +574,13 @@ struct FixedForm {
 struct MergeForm {
     csrf: Option<String>,
     into: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseForm {
+    csrf: Option<String>,
+    channel: String,
+    version: String,
 }
 
 fn back_to(id: i64) -> Response {
@@ -625,6 +660,72 @@ async fn merge(
             "Cannot merge (unknown, same cluster, or different app).",
         ),
         _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not merge."),
+    }
+}
+
+fn release_version(raw: &str) -> Option<String> {
+    let v = raw.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+async fn set_release_target(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<ReleaseForm>,
+) -> Response {
+    let session = match authenticate(&s, &headers) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !csrf_ok(&session, f.csrf.as_deref().unwrap_or("")) {
+        return notice(StatusCode::FORBIDDEN, "Bad CSRF token.");
+    }
+    let (channel, version) = (f.channel.trim().to_string(), release_version(&f.version));
+    let Some(version) = version else {
+        return notice(StatusCode::BAD_REQUEST, "Enter a target release version.");
+    };
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || db.set_release_target(id, &channel, &version)).await {
+        Ok(Ok(true)) => back_to(id),
+        Ok(Ok(false)) => notice(
+            StatusCode::BAD_REQUEST,
+            "Unknown cluster, channel, or version (beta must not be newer than stable).",
+        ),
+        _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not update."),
+    }
+}
+
+async fn mark_release_confirmed(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<ReleaseForm>,
+) -> Response {
+    let session = match authenticate(&s, &headers) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !csrf_ok(&session, f.csrf.as_deref().unwrap_or("")) {
+        return notice(StatusCode::FORBIDDEN, "Bad CSRF token.");
+    }
+    let (channel, version) = (f.channel.trim().to_string(), release_version(&f.version));
+    let Some(version) = version else {
+        return notice(
+            StatusCode::BAD_REQUEST,
+            "Enter the release version that shipped.",
+        );
+    };
+    let db = s.db.clone();
+    match tokio::task::spawn_blocking(move || db.mark_release_confirmed(id, &channel, &version))
+        .await
+    {
+        Ok(Ok(true)) => back_to(id),
+        Ok(Ok(false)) => notice(
+            StatusCode::BAD_REQUEST,
+            "Unknown cluster or channel, or no planned target to confirm.",
+        ),
+        _ => notice(StatusCode::INTERNAL_SERVER_ERROR, "Could not update."),
     }
 }
 
@@ -783,6 +884,14 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/admin/clusters/{id}/fixed", post(mark_fixed))
         .route("/admin/clusters/{id}/merge", post(merge))
         .route("/admin/clusters/{id}/promote", post(promote))
+        .route(
+            "/admin/clusters/{id}/release-target",
+            post(set_release_target),
+        )
+        .route(
+            "/admin/clusters/{id}/release-confirmed",
+            post(mark_release_confirmed),
+        )
         .route("/admin/quarantine", get(quarantine))
         .route("/admin/quarantine/{id}/{action}", post(quarantine_action))
         .route("/admin/symbols", get(symbols_page))

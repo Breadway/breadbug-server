@@ -90,6 +90,10 @@ fn row() -> ClusterRow {
         issue_key: None,
         issue_status: None,
         board_fixed: false,
+        target_beta: None,
+        confirmed_beta: None,
+        target_stable: None,
+        confirmed_stable: None,
         merged_into: None,
     }
 }
@@ -166,4 +170,101 @@ fn unknown_issue_statuses_are_not_cached() {
         Some("doing")
     );
     assert!(!db.set_issue_status(999, "doing").unwrap());
+}
+
+fn release_cluster() -> (Db, i64) {
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .new_cluster(
+            "bar",
+            "manual",
+            "t",
+            &Contribution {
+                report_id: 0,
+                install_hash: "i1",
+                version: Some("1.3.0"),
+                os_build: None,
+                at: 1,
+            },
+        )
+        .unwrap();
+    (db, id)
+}
+
+#[test]
+fn release_targets_confirm_flow_and_ordering() {
+    let (db, id) = release_cluster();
+    // Nothing tracked yet: no releases in the public view.
+    assert_eq!(releases_of(&db.cluster(id).unwrap().unwrap()), None);
+    // Bad channels, bad versions, unknown clusters are refused.
+    assert!(!db.set_release_target(id, "nightly", "1.4").unwrap());
+    assert!(!db.set_release_target(id, "beta", "").unwrap());
+    assert!(!db
+        .set_release_target(id, "beta", &"x".repeat(MAX_VERSION + 1))
+        .unwrap());
+    assert!(!db.set_release_target(999, "beta", "1.4").unwrap());
+    // Confirming needs a plan first.
+    assert!(!db.mark_release_confirmed(id, "beta", "1.4-beta1").unwrap());
+
+    assert!(db.set_release_target(id, "beta", "1.4-beta1").unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+    // A beta newer than the stable target is rejected both ways round.
+    assert!(!db.set_release_target(id, "beta", "1.5-beta1").unwrap());
+    assert!(!db.set_release_target(id, "stable", "1.3").unwrap());
+    // Dev and rc versions order below their release.
+    assert!(db
+        .set_release_target(id, "beta", "1.4-dev.20260101")
+        .unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+
+    let track = releases_of(&db.cluster(id).unwrap().unwrap()).unwrap();
+    assert_eq!(track.beta.planned.as_deref(), Some("1.4-dev.20260101"));
+    assert!(!track.beta.shipped);
+    assert_eq!(track.beta.shipped_in, None);
+
+    assert!(db.mark_release_confirmed(id, "beta", "1.4-beta2").unwrap());
+    let track = releases_of(&db.cluster(id).unwrap().unwrap()).unwrap();
+    assert!(track.beta.shipped);
+    assert_eq!(track.beta.shipped_in.as_deref(), Some("1.4-beta2"));
+    assert!(!track.stable.shipped);
+
+    assert!(db.mark_release_confirmed(id, "stable", "1.4").unwrap());
+    let track = releases_of(&db.cluster(id).unwrap().unwrap()).unwrap();
+    assert!(track.stable.shipped);
+    assert_eq!(track.stable.shipped_in.as_deref(), Some("1.4"));
+}
+
+#[test]
+fn release_confirmation_validates_versions_and_ordering() {
+    let (db, id) = release_cluster();
+    assert!(db.set_release_target(id, "beta", "1.4").unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+    // A confirmed beta newer than the planned stable is refused.
+    assert!(!db.mark_release_confirmed(id, "beta", "9.0").unwrap());
+    // A confirmed stable older than the planned beta is refused.
+    assert!(!db.mark_release_confirmed(id, "stable", "1.0").unwrap());
+    // Malformed versions are refused on both paths.
+    assert!(!db
+        .mark_release_confirmed(id, "beta", "not a version")
+        .unwrap());
+    assert!(!db
+        .mark_release_confirmed(id, "beta", "**1.4**\ninjected")
+        .unwrap());
+    assert!(!db.set_release_target(id, "stable", "1.4 marked").unwrap());
+    // Confirming inside the plan is accepted.
+    assert!(db.mark_release_confirmed(id, "beta", "1.4-beta2").unwrap());
+    // A planned stable below the confirmed beta is refused.
+    assert!(!db.set_release_target(id, "stable", "1.0").unwrap());
+    // A higher beta plan is fine: the confirmed beta dominates the check.
+    assert!(db.set_release_target(id, "beta", "1.5").unwrap());
+    assert!(db.mark_release_confirmed(id, "stable", "1.4").unwrap());
+}
+
+#[test]
+fn release_targets_reject_inverted_plan_both_directions() {
+    let (db, id) = release_cluster();
+    assert!(db.set_release_target(id, "beta", "1.4").unwrap());
+    assert!(db.set_release_target(id, "stable", "1.4").unwrap());
+    assert!(!db.set_release_target(id, "stable", "1.3").unwrap());
+    assert!(!db.set_release_target(id, "beta", "1.5").unwrap());
 }

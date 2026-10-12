@@ -18,6 +18,10 @@ fn cluster(kind: &str, count: u64, installs: u64, last_seen: u64) -> ClusterRow 
         fixed_in: None,
         issue_key: None,
         issue_status: None,
+        target_beta: None,
+        confirmed_beta: None,
+        target_stable: None,
+        confirmed_stable: None,
         merged_into: None,
         board_fixed: false,
     }

@@ -450,6 +450,23 @@ async fn report_status(
             if let Some(p) = st.progress {
                 body["progress"] = json!(p);
             }
+            if let Some(r) = st.releases {
+                fn channel(
+                    planned: Option<String>,
+                    shipped: bool,
+                    shipped_in: Option<String>,
+                ) -> Value {
+                    let mut c = json!({ "planned": planned, "shipped": shipped });
+                    if let Some(v) = shipped_in {
+                        c["shipped_in"] = json!(v);
+                    }
+                    c
+                }
+                body["releases"] = json!({
+                    "beta": channel(r.beta.planned, r.beta.shipped, r.beta.shipped_in),
+                    "stable": channel(r.stable.planned, r.stable.shipped, r.stable.shipped_in),
+                });
+            }
             Json(body).into_response()
         }
         Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "not found"),

@@ -595,3 +595,154 @@ async fn inbox_kind_filter_separates_manual_and_request_from_crashes() {
     assert!(requests.contains("Dark mode please"), "{requests}");
     assert!(!requests.contains("a crash happened"), "{requests}");
 }
+
+#[tokio::test]
+async fn release_targets_and_confirmations_flow_to_public_status() {
+    let h = harness(true);
+    let (_, posted) = public_post(
+        &h,
+        &"1".repeat(32),
+        &crash("clip::run", "boom", "bar", "1.3"),
+    )
+    .await;
+    let receipt = posted["receipt"].as_str().unwrap().to_string();
+    let id = h.st.db.clusters().unwrap()[0].id;
+    let target = |channel: &str, version: &str| {
+        post_form(
+            &format!("/admin/clusters/{id}/release-target"),
+            &format!("channel={channel}&version={version}"),
+            &bearer(),
+        )
+    };
+    let confirm = |channel: &str, version: &str| {
+        post_form(
+            &format!("/admin/clusters/{id}/release-confirmed"),
+            &format!("channel={channel}&version={version}"),
+            &bearer(),
+        )
+    };
+
+    // No releases tracked yet: no releases field in public status.
+    let (_, before) = public_post(
+        &h,
+        &"2".repeat(32),
+        &crash("clip::run", "boom", "bar", "1.3"),
+    )
+    .await;
+    let _ = before;
+    let status = public_status(&h, &receipt).await;
+    assert!(status.get("releases").is_none(), "{status}");
+
+    // Confirming before planning is refused; bad channels and bad ordering too.
+    assert_eq!(
+        admin(&h, confirm("beta", "1.4-beta1")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        admin(&h, target("nightly", "1.4")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        admin(&h, target("beta", "1.4-beta1")).await.status,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        admin(&h, target("stable", "1.3")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        admin(&h, target("stable", "1.4")).await.status,
+        StatusCode::SEE_OTHER
+    );
+
+    // Planned but unshipped on both channels.
+    assert_eq!(
+        public_status(&h, &receipt).await,
+        json!({
+            "status": "duplicate",
+            "releases": {
+                "beta": {"planned": "1.4-beta1", "shipped": false},
+                "stable": {"planned": "1.4", "shipped": false},
+            },
+        })
+    );
+
+    // Confirm beta: shipped with the confirmed version named.
+    assert_eq!(
+        admin(&h, confirm("beta", "1.4-beta2")).await.status,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        public_status(&h, &receipt).await,
+        json!({
+            "status": "duplicate",
+            "releases": {
+                "beta": {"planned": "1.4-beta1", "shipped": true, "shipped_in": "1.4-beta2"},
+                "stable": {"planned": "1.4", "shipped": false},
+            },
+        })
+    );
+    // The detail page shows the same plan.
+    let page = admin(&h, get(&format!("/admin/clusters/{id}"))).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains("1.4-beta1") && page.body.contains("shipped 1.4-beta2"),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn singleton_cluster_exposes_release_plan() {
+    let h = harness(true);
+    let (_, posted) = public_post(
+        &h,
+        &"3".repeat(32),
+        &crash("clip::run", "boom", "bar", "1.3"),
+    )
+    .await;
+    let receipt = posted["receipt"].as_str().unwrap().to_string();
+    let id = h.st.db.clusters().unwrap()[0].id;
+    // One report only: still "received", but a planned release must show.
+    let status = public_status(&h, &receipt).await;
+    assert_eq!(status["status"], "received");
+    assert!(status.get("releases").is_none(), "{status}");
+    assert_eq!(
+        admin(
+            &h,
+            post_form(
+                &format!("/admin/clusters/{id}/release-target"),
+                "channel=beta&version=1.4-beta1",
+                &bearer(),
+            )
+        )
+        .await
+        .status,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        public_status(&h, &receipt).await,
+        json!({
+            "status": "received",
+            "releases": {
+                "beta": {"planned": "1.4-beta1", "shipped": false},
+                "stable": {"planned": null, "shipped": false},
+            },
+        })
+    );
+}
+
+async fn public_status(h: &H, receipt: &str) -> Value {
+    let resp = public_router(h.st.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/reports/{receipt}/status"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&b).unwrap()
+}
