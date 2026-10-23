@@ -798,6 +798,12 @@ pub fn maintain(s: &AppState) -> Result<usize> {
     if purged > 0 {
         s.db.compact()?;
     }
+    // Reports deleted by their reporter leave a zero-count cluster behind.
+    match s.db.prune_empty_clusters() {
+        Ok(n) if n > 0 => tracing::info!(clusters = n, "pruned empty clusters"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "pruning empty clusters failed"),
+    }
     match crate::lifecycle::sync_issue_states(s) {
         Ok(n) if n > 0 => tracing::info!(fixed = n, "clusters marked fixed from breadboard"),
         Ok(_) => {}
