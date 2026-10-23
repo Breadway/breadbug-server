@@ -793,6 +793,36 @@ impl Db {
         Ok(())
     }
 
+    /// Forget the vector but remember which model looked at the cluster, so a
+    /// cluster with nothing left to match on is not retried every hour.
+    pub fn clear_embedding(&self, id: i64, model: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE clusters SET embedding = NULL, emb_n = 0, emb_model = ?2 WHERE id = ?1",
+            params![id, model],
+        )?;
+        Ok(())
+    }
+
+    /// Follow `merged_into` to the live cluster.
+    pub fn resolve_cluster_id(&self, id: i64) -> Result<i64> {
+        Self::resolve(&self.conn(), id)
+    }
+
+    /// Fuzzy clusters whose vectors came from another model (or none).
+    pub fn stale_fuzzy_cluster_ids(&self, model: &str) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM clusters
+             WHERE fingerprint IS NULL AND merged_into IS NULL
+               AND (emb_model IS NULL OR emb_model != ?1)
+             ORDER BY id",
+        )?;
+        let ids = stmt
+            .query_map(params![model], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Ids of live fuzzy (unfingerprinted) clusters.
     pub fn fuzzy_cluster_ids(&self) -> Result<Vec<i64>> {
         let conn = self.conn();

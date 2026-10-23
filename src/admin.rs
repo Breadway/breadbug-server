@@ -666,10 +666,26 @@ async fn merge(
     let Ok(into) = f.into.trim().trim_start_matches('#').parse::<i64>() else {
         return notice(StatusCode::BAD_REQUEST, "Enter a cluster number.");
     };
-    let db = s.db.clone();
-    match tokio::task::spawn_blocking(move || db.merge_clusters(id, into)).await {
-        Ok(Ok(true)) => Redirect::to(&format!("/admin/clusters/{into}")).into_response(),
-        Ok(Ok(false)) => notice(
+    let state = s.clone();
+    match tokio::task::spawn_blocking(move || {
+        let merged = state.db.merge_clusters(id, into)?;
+        if !merged {
+            return Ok::<Option<i64>, anyhow::Error>(None);
+        }
+        let target = state.db.resolve_cluster_id(into)?;
+        // Fold the moved reports into the survivor's vector. Without this,
+        // the wording that was just merged in still matches nothing and the
+        // same duplicate starts a fresh cluster next time.
+        if let Err(e) = crate::cluster::reembed_cluster(&state.db, state.fuzzy().embedder, target)
+        {
+            tracing::error!(error = %e, "reembed after merge failed");
+        }
+        Ok(Some(target))
+    })
+    .await
+    {
+        Ok(Ok(Some(target))) => Redirect::to(&format!("/admin/clusters/{target}")).into_response(),
+        Ok(Ok(None)) => notice(
             StatusCode::BAD_REQUEST,
             "Cannot merge (unknown, same cluster, or different app).",
         ),

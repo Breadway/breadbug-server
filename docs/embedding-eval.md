@@ -1,45 +1,94 @@
 # Fuzzy clustering evaluation
 
 Reports with no stable fingerprint (behavior reports, freezes without a
-stack) are matched by text similarity. `tests/fuzzy.rs` measures the matcher
-on `tests/fixtures/fuzzy_eval.json`: 8 problems, 3 deliberately differently
-worded descriptions each, so 24 same-problem pairs and 252 different-problem
-pairs.
+stack, manual reports and feature requests) are matched by text similarity.
+Two labelled sets measure the matcher:
 
-| Embedder | Threshold | Precision | Recall | False positives |
-|----------|-----------|-----------|--------|-----------------|
-| built-in hashing (unigrams + bigrams) | 0.30 | 1.00 | 0.71 | 0 |
+- `tests/fixtures/fuzzy_eval.json` (v1): 8 problems, 3 wordings each, written
+  while the built-in hashing embedder was being tuned. Its wordings share
+  vocabulary, so it flatters bag-of-words matching.
+- `tests/fixtures/fuzzy_eval_v2.json` (v2): 10 problems, 4 wordings each,
+  written against the symptom with deliberate synonyms, plus 9 hard negatives
+  (different problems that read alike). This is the number to trust.
 
-The highest similarity between two different problems in the set is 0.27, so
-0.30 is just above the noise floor. Raising it to 0.35 drops recall to 0.46.
-The test fails if precision falls below 0.95 or recall below 0.65.
+| Embedder | Threshold | v1 precision | v1 recall | v2 precision | v2 recall |
+|----------|-----------|--------------|-----------|--------------|-----------|
+| built-in hashing (unigrams + bigrams) | 0.30 | 1.00 | 0.71 | 0.25 | 0.02 |
+| `all-MiniLM-L6-v2` (local TEI) | 0.50 | 1.00 | 1.00 | 0.98 | 0.67 |
+
+The hashing embedder collapses on v2 because it only matches shared words:
+"battery drains fast while asleep" against "high power use while suspended"
+scores 0.00. It remains the zero-dependency fallback when no embedding
+service is configured.
+
+`all-MiniLM-L6-v2` is served by the `breadbug-embed` sidecar in
+`packaging/docker-compose.yml` (`text-embeddings-inference`, CPU). The
+threshold is model-specific and set with `BREADBUG_FUZZY_THRESHOLD`.
+
+## Threshold choice for MiniLM
+
+| Threshold | v2 precision | v2 recall | Hard negatives above it |
+|-----------|--------------|-----------|-------------------------|
+| 0.45 | 0.93 | 0.72 | 9 of 9 |
+| 0.50 | 0.98 | 0.67 | 9 of 9 |
+| 0.55 | 1.00 | 0.53 | 8 of 9 |
+
+0.50 is the default because a wrong merge hides a bug while a missed merge
+costs one triage click. Precision matters more: clusters cannot be split
+today (only merged), so a false merge is not undoable.
 
 ## What this does and does not do
 
-The built-in embedder is a bag of words and bigrams hashed into 256
-dimensions. It needs no model download and runs anywhere, but it only matches
-descriptions that share vocabulary. Paraphrases with no words in common are
-missed (the 29% of same-problem pairs that fall below the threshold), so
-duplicates may land in separate clusters; triage can merge them by hand.
-Precision matters more than recall here: a wrong merge hides a bug, a missed
-merge only costs a click.
+- Same app and same report kind only; never across either.
+- Compared against the centroid of each live fuzzy cluster; the best match at
+  or above the threshold wins, otherwise a new cluster starts.
+- The centroid is the running mean of its reports' vectors. A manual merge
+  rebuilds the survivor from all its stored reports, so the wording that was
+  folded in matches the next time it arrives.
+- Fewer than three distinct meaningful words means nothing to match on: the
+  report is stored unclustered.
+- Report text is data. It is only sent to the local embedding service; it is
+  never executed, templated, or sent to a third party. The service URL must
+  resolve to loopback or private addresses, checked at startup and on every
+  call.
+- Assignment is greedy and arrival-order dependent. On v2 at 0.50 the 40
+  reports form 16 clusters for 10 problems: some duplicate pairs score below
+  the threshold and only merge by hand.
+- Small sentence models are weak on fine distinctions. These different
+  problems score 0.52 to 0.91 with MiniLM and would merge at 0.50:
+  "video playback stutters in jellyfin" / "audio playback stutters in
+  jellyfin"; "wifi disconnects after waking" / "bluetooth disconnects after
+  waking". A cross-encoder reranker on the candidate pair is the next step if
+  that becomes a real triage problem.
 
-For better paraphrase handling set `BREADBUG_EMBED_URL` to a local
-sentence-embedding service (text-embeddings-inference style: `POST` with
-`{"inputs": ["..."]}` returning `[[f32...]]`) and `BREADBUG_EMBED_MODEL` to its
-name. Only loopback and private addresses are accepted so report text never
-leaves the machine. Vectors are stored with a model name and only compared
-within the same model; `cluster::reembed_all` rebuilds centroids when the
-model changes. Re-run the evaluation and retune `BREADBUG_FUZZY_THRESHOLD`
-for the new model before relying on it.
+## Running the evaluation
+
+The hashing embedder is covered by `tests/fuzzy.rs` in normal CI. A real
+backend needs its service running:
+
+```sh
+BREADBUG_EVAL_EMBED_URL=http://127.0.0.1:8181/embed \
+BREADBUG_EVAL_EMBED_MODEL=all-MiniLM-L6-v2 \
+BREADBUG_EVAL_THRESHOLD=0.50 \
+  cargo test --test fuzzy_embedding_eval -- --ignored --nocapture
+```
+
+The test fails below 0.90 precision or 0.55 recall on either set.
+
+For a production-like check, point `BREADBUG_EVAL_EMBED_URL` at the sidecar
+(`http://breadbug-embed:8080/embed`) from a container on the `packaging_breadbug`
+network.
 
 ## Matching rules
 
-* Same app and same report kind only; never across either.
-* Compared against the centroid of each live fuzzy cluster; the best match at
+- Same app and same report kind only; never across either.
+- Compared against the centroid of each live fuzzy cluster; the best match at
   or above the threshold wins, otherwise a new cluster starts.
-* The centroid is the running mean of its reports' vectors.
-* Fewer than three distinct meaningful words (ignoring the report-type
-  label) means nothing to match on: the report is stored unclustered.
-* Report text is data. It is only tokenised and hashed; it is never executed,
-  templated, or sent to a third party.
+- The centroid is the running mean of its reports' vectors, renormalised.
+- Report text is the user's words (title, want, notes weighted by repetition),
+  panic messages and locations, warn/error log lines, symbol names and recent
+  event names. The report kind is not part of the vector: it is already a hard
+  filter, and including it would inflate every same-kind score.
+- Vectors are stored with a model name and only compared within the same
+  model. `cluster::reembed_stale` rebuilds clusters whose model changed on the
+  hourly maintenance pass and at startup.

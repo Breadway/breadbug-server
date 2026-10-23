@@ -19,6 +19,14 @@ services:
     environment:
       BREADBUG_TRUST_PROXY: "1"
       BREADBUG_RETENTION_DAYS: "90"
+      # Local sentence embeddings, served by the breadbug-embed sidecar on the
+      # same isolated network. Report text never leaves the machine: the
+      # address must resolve to loopback or private space.
+      BREADBUG_EMBED_URL: "${BREADBUG_EMBED_URL:-http://breadbug-embed:8080/embed}"
+      BREADBUG_EMBED_MODEL: "${BREADBUG_EMBED_MODEL:-all-MiniLM-L6-v2}"
+      # Tuned for all-MiniLM-L6-v2 on tests/fixtures/fuzzy_eval_v2.json
+      # (precision 0.98, recall 0.67); see docs/embedding-eval.md.
+      BREADBUG_FUZZY_THRESHOLD: "${BREADBUG_FUZZY_THRESHOLD:-0.50}"
       # public base of the cluster pages, linked from promoted issues
       BREADBUG_CLUSTER_URL: "${BREADBUG_CLUSTER_URL:-}"
       # sha256 of the admin bearer token; unset disables the admin UI
@@ -27,6 +35,9 @@ services:
       # dedicated minimum-scope token, mounted as a file, never baked in.
       BREADBUG_BOARD_URL: "${BREADBUG_BOARD_URL:-}"
       BREADBUG_BOARD_TOKEN_FILE: "${BREADBUG_BOARD_TOKEN_FILE:-}"
+    depends_on:
+      breadbug-embed:
+        condition: service_healthy
     volumes:
       - breadbug-data:/data
       # Debug symbols published by the release pipelines (ECO-67), read only.
@@ -48,8 +59,41 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # CPU sentence-embedding service for fuzzy clustering. Not published: only
+  # breadbug-server reaches it, over the private compose network. The model
+  # cache is a named volume so restarts do not re-download.
+  breadbug-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    container_name: breadbug-embed
+    restart: unless-stopped
+    command: ["--model-id", "sentence-transformers/all-MiniLM-L6-v2", "--port", "8080"]
+    environment:
+      HF_HOME: /data
+    volumes:
+      - breadbug-embed-cache:/data
+    networks:
+      - breadbug
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 volumes:
   breadbug-data:
+  breadbug-embed-cache:
 
 networks:
   breadbug:

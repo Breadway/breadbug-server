@@ -74,17 +74,26 @@ Configuration is environment variables (`src/config.rs`): `BREADBUG_DATA_DIR`,
 Checklist (nothing here is done by CI):
 
 1. DNS for `bugs.breadway.dev` at Aegis and the Caddy blocks from the infra
-   repo (`feature/bugs-breadway-dev`), then `./deploy.sh` there.
+   repo, then `./deploy.sh` there.
 2. On Hestia: `/srv/breadbug-symbols` (written by the release pipelines,
    mounted read-only), a `.env` with `BREADBUG_ADMIN_TOKEN_SHA256`
    (`printf '%s' "$TOKEN" | sha256sum`), optionally the breadboard URL and a
    token file.
-3. `docker compose -f packaging/docker-compose.yml up -d --build`. Check
+3. `docker compose -f packaging/docker-compose.yml up -d --build`. This also
+   starts the `breadbug-embed` sentence-embedding sidecar (CPU, no published
+   port, model cached in a named volume). Check
    `curl -s http://127.0.0.1:8120/healthz` on Hestia and the public hostname.
-4. Reach the admin UI only over Tailscale/LAN at `127.0.0.1:8121` on Hestia
+4. Confirm the log line `clustering uses the local embedding service` names
+   `http:all-MiniLM-L6-v2`; if it says the built-in embedder, the URL did not
+   resolve to a private address and clustering silently degraded.
+5. Reach the admin UI only over Tailscale/LAN at `127.0.0.1:8121` on Hestia
    (for example through an SSH tunnel); it is never routed publicly.
-5. Point `endpoint` in `breadbug.toml` (default `https://bugs.breadway.dev`)
+6. Point `endpoint` in `breadbug.toml` (default `https://bugs.breadway.dev`)
    at it from a test machine and send a saved test report.
+7. Before changing the model or threshold, re-run the evaluation in
+   `docs/embedding-eval.md`. Switching models re-embeds clusters on the next
+   maintenance pass; changing the threshold does not re-cluster existing
+   reports.
 
 
 `packaging/docker-compose.yml` runs it isolated on Hestia; the public hostname

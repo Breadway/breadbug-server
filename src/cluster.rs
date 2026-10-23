@@ -106,23 +106,57 @@ fn assign_fuzzy(
     }
 }
 
+/// Recompute one fuzzy cluster's centroid from its stored reports. Used when
+/// the embedding model changes and after a manual merge, so the survivor can
+/// match the wording that was just folded into it. Fingerprint clusters have
+/// no fuzzy space and are left alone.
+pub fn reembed_cluster(db: &Db, embedder: &dyn Embedder, id: i64) -> Result<bool> {
+    let id = db.resolve_cluster_id(id)?;
+    let Some(row) = db.cluster(id)? else {
+        return Ok(false);
+    };
+    if row.fingerprint.is_some() {
+        return Ok(false);
+    }
+    let mut vectors = Vec::new();
+    for raw in db.cluster_report_raws(id)? {
+        let Ok(report) = serde_json::from_str::<Report>(&raw) else {
+            continue;
+        };
+        let text = report_text(&report);
+        if meaningful(&text) >= MIN_TOKENS {
+            vectors.push(embedder.embed(&text)?);
+        }
+    }
+    match centroid(&vectors) {
+        Some(c) => db.set_embedding(id, &c, vectors.len() as u64, embedder.model())?,
+        // Nothing left to match on (deleted or purged reports). Record the
+        // current model so the hourly pass does not retry it forever.
+        None => db.clear_embedding(id, embedder.model())?,
+    }
+    Ok(true)
+}
+
 /// Recompute every fuzzy cluster's centroid from its member reports, for
 /// when the embedding model changes. Returns how many were updated.
 pub fn reembed_all(db: &Db, embedder: &dyn Embedder) -> Result<usize> {
     let mut updated = 0;
     for id in db.fuzzy_cluster_ids()? {
-        let mut vectors = Vec::new();
-        for raw in db.cluster_report_raws(id)? {
-            let Ok(report) = serde_json::from_str::<Report>(&raw) else {
-                continue;
-            };
-            let text = report_text(&report);
-            if meaningful(&text) >= MIN_TOKENS {
-                vectors.push(embedder.embed(&text)?);
-            }
+        if reembed_cluster(db, embedder, id)? {
+            updated += 1;
         }
-        if let Some(c) = centroid(&vectors) {
-            db.set_embedding(id, &c, vectors.len() as u64, embedder.model())?;
+    }
+    Ok(updated)
+}
+
+/// Rebuild only clusters whose vectors came from a different model. This is
+/// what switching from the built-in hashing embedder to a local model needs;
+/// without it, old clusters keep vectors the new model never compares
+/// against and silently stop matching.
+pub fn reembed_stale(db: &Db, embedder: &dyn Embedder) -> Result<usize> {
+    let mut updated = 0;
+    for id in db.stale_fuzzy_cluster_ids(embedder.model())? {
+        if reembed_cluster(db, embedder, id)? {
             updated += 1;
         }
     }

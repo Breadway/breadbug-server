@@ -1,0 +1,107 @@
+{
+  "about": "Independently worded fuzzy-clustering eval, written against the user-facing symptom rather than the embedder. Each group is one problem described four ways; hard_negatives are pairs that read alike but are different problems.",
+  "groups": [
+    {
+      "label": "clip-history-gone",
+      "texts": [
+        "clipboard history is wiped when I log back in",
+        "every thing I copied is missing after the session ends",
+        "the copy list starts empty each time I reboot",
+        "clipboard keeps nothing across logout"
+      ]
+    },
+    {
+      "label": "clip-paste-hang",
+      "texts": [
+        "copying a screenshot locks the whole desktop up for a minute",
+        "pasting a big image makes the clipboard freeze",
+        "a large picture on the clipboard hangs the app",
+        "the desktop stalls whenever I paste something huge"
+      ]
+    },
+    {
+      "label": "bar-battery-stale",
+      "texts": [
+        "battery figure in the bar does not change after I wake the laptop",
+        "the percentage stays at the old value following suspend",
+        "after resume the bar still shows the level from before",
+        "power reading is stuck until I log out and back in"
+      ]
+    },
+    {
+      "label": "net-wifi-wake",
+      "texts": [
+        "wifi is gone after the lid opens and I have to reconnect",
+        "network drops every time the machine comes back from sleep",
+        "no internet after suspend until I toggle the adapter",
+        "wireless disconnects on resume"
+      ]
+    },
+    {
+      "label": "bar-workspace-monitor",
+      "texts": [
+        "workspace buttons disappear once a second display is attached",
+        "plugging in another monitor removes the workspace switcher from the bar",
+        "the workspaces widget is missing after I connect the external screen",
+        "adding a display makes the workspace list vanish"
+      ]
+    },
+    {
+      "label": "search-index-slow",
+      "texts": [
+        "indexing my documents takes hours",
+        "the search crawler is painfully slow on a big folder",
+        "building the search index over a large directory never finishes",
+        "documents take forever to be scanned for search"
+      ]
+    },
+    {
+      "label": "lock-rejects-password",
+      "texts": [
+        "the lock screen refuses my correct password",
+        "unlocking fails with wrong password even though it is right",
+        "login says the password is incorrect when it is not",
+        "I cannot get past the lock, it rejects what I typed"
+      ]
+    },
+    {
+      "label": "paper-wallpaper-black",
+      "texts": [
+        "background goes black when I switch the colour scheme",
+        "changing the palette makes the wallpaper disappear",
+        "the desktop picture turns black after a theme change",
+        "wallpaper is lost on palette switch"
+      ]
+    },
+    {
+      "label": "pad-notes-lost",
+      "texts": [
+        "scratchpad forgets what I typed when I shut the window",
+        "closing the notes window throws away the text",
+        "notes vanish if I close the pad without saving",
+        "everything written in the pad is gone after closing it"
+      ]
+    },
+    {
+      "label": "video-stutter",
+      "texts": [
+        "films play choppy with dropped frames",
+        "playback stutters constantly during movies",
+        "video is not smooth, it judders every few seconds",
+        "watching a show is unwatchable because of the frame drops"
+      ]
+    }
+  ],
+  "hard_negatives": [
+    ["bar shows the wrong battery percentage", "bar shows the wrong clock time"],
+    ["notes are lost after closing the window", "settings are lost after closing the window"],
+    ["search is slow indexing documents", "search is slow when typing in the box"],
+    ["app crashes when I open settings", "app crashes when I open the file manager"],
+    ["wallpaper turns black after theme change", "window turns black after theme change"],
+    ["clipboard history is empty after restart", "download history is empty after restart"],
+    ["video playback stutters in jellyfin", "audio playback stutters in jellyfin"],
+    ["wifi disconnects after waking from sleep", "bluetooth disconnects after waking from sleep"],
+    ["pasting a large image freezes the clipboard", "pasting a large file freezes the file manager"],
+    ["lock screen rejects the correct password", "login rejects the correct password for the git server"]
+  ]
+}
