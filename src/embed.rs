@@ -10,9 +10,10 @@
 //! wanted. Report text never goes to a third party.
 
 use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::schema::Report;
@@ -105,36 +106,66 @@ impl Embedder for HashEmbedder {
 }
 
 /// Calls a local embedding service: `POST {url}` with `{"inputs": [text]}`,
-/// expecting `[[f32, ...]]`. Only literal loopback IP addresses are
-/// accepted; report text must not leave the machine.
+/// expecting `[[f32, ...]]`. The host must resolve only to loopback or
+/// private addresses, checked at construction and again on every call, so
+/// report text never leaves the machine even if DNS changes underneath us.
 pub struct HttpEmbedder {
     url: String,
+    host: String,
+    port: u16,
     model: String,
     agent: ureq::Agent,
 }
 
-fn local_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    parsed.scheme() == "http"
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parsed.fragment().is_none()
-        && match parsed.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
+/// Loopback, RFC1918 and IPv6 unique-local only.
+fn allowed_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback() || (seg[0] & 0xfe00) == 0xfc00
         }
+    }
+}
+
+/// Resolve `host:port` and require every address to be loopback or private.
+fn resolve_allowed(host: &str, port: u16) -> Result<()> {
+    let addrs: Vec<IpAddr> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve embedding service {host}:{port}"))?
+        .map(|a| a.ip())
+        .collect();
+    if addrs.is_empty() {
+        bail!("embedding service {host}:{port} resolved to no addresses");
+    }
+    if let Some(bad) = addrs.iter().find(|ip| !allowed_ip(**ip)) {
+        bail!("embedding service must stay on loopback or a private network (got {bad})");
+    }
+    Ok(())
 }
 
 impl HttpEmbedder {
     pub fn new(url: &str, model: &str) -> Result<Self> {
-        if !local_url(url) {
-            bail!("embedding service must be a local http:// address (got {url})");
+        let parsed = url::Url::parse(url).with_context(|| format!("parse embedding URL {url}"))?;
+        if parsed.scheme() != "http"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("embedding service must be a plain local http:// URL (got {url})");
         }
+        let host = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Ipv6(ip)) => ip.to_string(),
+            Some(url::Host::Domain(d)) => d.to_string(),
+            None => bail!("embedding URL has no host"),
+        };
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        resolve_allowed(&host, port)?;
         Ok(Self {
             url: url.to_string(),
+            host,
+            port,
             model: format!("http:{model}"),
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
@@ -151,6 +182,9 @@ impl Embedder for HttpEmbedder {
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        // Re-check every time: a name that resolved inside the LAN at startup
+        // must not start resolving to a public address later.
+        resolve_allowed(&self.host, self.port)?;
         let resp = self
             .agent
             .post(&self.url)
@@ -206,10 +240,12 @@ pub fn from_bytes(b: &[u8]) -> Vec<f32> {
 }
 
 /// The text a report is matched on: what the user said and what went wrong,
-/// not machine facts (those are the same for everyone).
+/// not machine facts (those are the same for everyone). The report kind is
+/// deliberately absent: it is already a hard filter in candidate lookup, and
+/// including it would add the same token to every vector and raise every
+/// same-kind score.
 pub fn report_text(r: &Report) -> String {
     let mut parts: Vec<String> = Vec::new();
-    parts.push(r.report_type.as_str().to_string());
     if let Some(t) = &r.title {
         // A manual report's title names the problem: count it twice, like notes.
         parts.push(t.clone());

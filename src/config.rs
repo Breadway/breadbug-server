@@ -38,10 +38,11 @@ pub struct Config {
     /// by the release pipeline. Defaults to `<data_dir>/symbols`.
     pub symbol_dir: Option<PathBuf>,
     /// Cosine similarity at which a report joins an existing fuzzy cluster.
-    /// Tuned on `tests/fixtures/fuzzy_eval.json` (see docs/embedding-eval.md).
+    /// Model-specific: 0.30 for the built-in hashing embedder, 0.50 for
+    /// `all-MiniLM-L6-v2` (see docs/embedding-eval.md).
     pub fuzzy_threshold: f32,
-    /// Local embedding service (`http://127.0.0.1:...`); the built-in hashing
-    /// embedder is used when unset.
+    /// Local embedding service (`http://127.0.0.1:...` or a private address);
+    /// the built-in hashing embedder is used when unset.
     pub embed_url: Option<String>,
     /// Name recorded with vectors from `embed_url`, so a model change forces
     /// a re-embed instead of mixing vector spaces.

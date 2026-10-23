@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use breadbug_server::app::{public_router, AppState};
-use breadbug_server::cluster::reembed_all;
+use breadbug_server::cluster::{reembed_all, reembed_cluster, reembed_stale};
 use breadbug_server::config::Config;
 use breadbug_server::crypto::sha256_hex;
 use breadbug_server::db::Db;
@@ -161,6 +161,75 @@ async fn threshold_is_configurable() {
     )
     .await;
     assert_ne!(st.db.cluster_of(&a).unwrap(), st.db.cluster_of(&b).unwrap());
+}
+
+#[tokio::test]
+async fn merging_folds_the_moved_wording_into_the_survivor() {
+    let (st, _d) = state(|_| {});
+    let x = send(
+        &st,
+        1,
+        "pad",
+        "behavior",
+        "notes written in the scratchpad vanish after closing it",
+    )
+    .await;
+    let z = send(
+        &st,
+        2,
+        "pad",
+        "behavior",
+        "text typed into the scratchpad is gone when it is closed and reopened",
+    )
+    .await;
+    let cx = st.db.cluster_of(&x).unwrap().unwrap();
+    let cz = st.db.cluster_of(&z).unwrap().unwrap();
+    assert_ne!(cx, cz, "below the threshold, so they start apart");
+
+    assert!(st.db.merge_clusters(cz, cx).unwrap());
+    reembed_cluster(&st.db, &HashEmbedder, cx).unwrap();
+
+    // Same wording as the merged-away report: it must join the survivor
+    // instead of starting yet another cluster.
+    let again = send(
+        &st,
+        3,
+        "pad",
+        "behavior",
+        "text typed into the scratchpad is gone when it is closed and reopened",
+    )
+    .await;
+    assert_eq!(st.db.cluster_of(&again).unwrap(), Some(cx));
+}
+
+#[tokio::test]
+async fn a_model_switch_reembeds_only_stale_clusters() {
+    let (st, _d) = state(|_| {});
+    send(
+        &st,
+        1,
+        "clip",
+        "behavior",
+        "clipboard hangs when I paste a large image",
+    )
+    .await;
+    assert_eq!(
+        st.db
+            .stale_fuzzy_cluster_ids("hash-v1-256")
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(),
+        1
+    );
+    assert_eq!(reembed_stale(&st.db, &Other).unwrap(), 1);
+    assert_eq!(
+        st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(),
+        0
+    );
+    assert_eq!(reembed_stale(&st.db, &Other).unwrap(), 0);
 }
 
 struct Other;

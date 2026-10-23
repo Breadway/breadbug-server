@@ -118,7 +118,10 @@ fn load_rules(cfg: &Config) -> ScoreRules {
 fn make_embedder(cfg: &Config) -> Box<dyn Embedder> {
     if let Some(url) = &cfg.embed_url {
         match HttpEmbedder::new(url, &cfg.embed_model) {
-            Ok(e) => return Box::new(e),
+            Ok(e) => {
+                tracing::info!(model = e.model(), url = %url, "clustering uses the local embedding service");
+                return Box::new(e);
+            }
             Err(e) => {
                 tracing::error!(error = %e, "embedding service unusable; using the built-in embedder")
             }
@@ -781,8 +784,15 @@ fn notices_json(notices: Vec<crate::db::Notice>) -> Vec<Value> {
         .collect()
 }
 
-/// One maintenance pass: retention, then compaction.
+/// One maintenance pass: model catch-up, retention, then compaction.
 pub fn maintain(s: &AppState) -> Result<usize> {
+    // Clusters embedded with another model would silently stop matching, so
+    // rebuild them before anything else. Cheap when nothing is stale.
+    match crate::cluster::reembed_stale(&s.db, s.fuzzy().embedder) {
+        Ok(n) if n > 0 => tracing::info!(clusters = n, "re-embedded for the current model"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "re-embedding stale clusters failed"),
+    }
     let cutoff = now_unix().saturating_sub(s.cfg.retention.as_secs());
     let purged = s.db.purge_before(cutoff)?;
     if purged > 0 {
