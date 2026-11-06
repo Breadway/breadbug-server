@@ -115,6 +115,11 @@ consistent backup API, deletes expired raw rows in the backup, securely clears
 freed pages and vacuums before atomic replacement. Keep exactly one generation
 at the destination. Never copy a live database or its WAL as a backup.
 
+Deleting a report (by receipt, by an admin, or by retention purge) first takes
+it out of its cluster, so a note-derived cluster title, its embedding centroid
+and its install hash do not outlive the raw row. Clusters a human acted on keep
+their issue or merge link with a neutral title once their last report is gone.
+
 Explicit deletions propagate on the next successful rotation because the new
 snapshot comes from the current database. Until rotation the previous backup
 can still contain a deleted report. Failed rotation preserves the previous

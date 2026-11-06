@@ -18,11 +18,15 @@ byte as hostile. This is what the server defends against and how.
 | Follow token probing | Follow and unfollow tokens are 256 bits; unknown tokens are 404 without saying why; follow responses never name other followers |
 | Notification pile-up | Notices are one row per follow per transition text; reads are a non-destructive peek and the client acks ids, delivered rows are kept for dedup, unfollowing discards pending notices |
 | Replay / duplicates | An identical payload from the same install returns the original receipt |
-| Re-identification via free text | Notes and logs are scrubbed client- and server-side; raw reports are deleted after 90 days (cluster metadata is kept) and on request |
+| Re-identification via free text | Notes and logs are scrubbed client- and server-side; raw reports are deleted after 90 days and on request. Deleting or purging a report also takes it out of its cluster: a fuzzy cluster's note-derived title and embedding centroid are rebuilt from the reports that remain, its install hash is dropped once no report from that install is left, and an empty cluster nobody acted on is removed. A cluster a human acted on (linked issue or merge target) is kept, but once no reports remain its title is replaced with a neutral `"<kind> report for <app>"` and its centroid is cleared, so the link survives without the note |
 | Container compromise | Own network and volume, non-root, read-only rootfs, no capabilities, no host mounts, no shared credentials |
 | Stale data on disk | `secure_delete` and WAL truncation after deletes |
 
 Out of scope for v1: screenshots, process memory, user accounts.
+
+Promoting a cluster files a breadboard issue whose body includes already-scrubbed
+evidence from the newest reports. That copy lives in breadboard: deleting a
+report here later does not edit an issue that was already filed.
 
 Backup privacy: `packaging/backup.py` removes expired raw payloads from a
 consistent snapshot and compacts it before replacing the single backup

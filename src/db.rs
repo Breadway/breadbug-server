@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::crypto::ct_eq;
+use crate::embed::{centroid, Embedder};
 
 /// A report ready to store. `raw` is the already-scrubbed JSON.
 pub struct NewReport<'a> {
@@ -188,6 +189,10 @@ pub const KNOWN_ISSUE_STATUSES: &[&str] = &["backlog", "todo", "doing", "review"
 /// `(cluster id, centroid, reports folded into it)`.
 pub type FuzzyCandidate = (i64, Vec<f32>, u64);
 
+/// `(centroid or none, reports folded in, model)` for tests.
+#[doc(hidden)]
+pub type EmbeddingSnapshot = (Option<Vec<f32>>, u64, Option<String>);
+
 /// A stored report, for maintenance jobs.
 pub struct StoredReport {
     pub id: i64,
@@ -260,6 +265,14 @@ fn unbump(map_json: &str, key: Option<&str>) -> String {
         }
     }
     serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+}
+
+/// Title for a fuzzy cluster whose raw reports have all been deleted but
+/// which is kept because a human acted on it (a linked issue or a merge
+/// target). It names only the machine facts, never the user's note, so the
+/// existing promotion link keeps working without retaining free text.
+fn neutral_title(app: &str, kind: &str) -> String {
+    format!("{kind} report for {app}")
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -439,8 +452,15 @@ impl Db {
 
     /// Delete a report if `token_hash` matches. Returns whether it existed
     /// and matched; a wrong token and an unknown receipt look the same. The
-    /// report's cluster count (and per-version counts) go down with it.
-    pub fn delete_report(&self, receipt: &str, token_hash: &str) -> Result<bool> {
+    /// report's cluster count (and per-version counts) go down with it, and a
+    /// fuzzy cluster's note-derived title and centroid are rebuilt from the
+    /// reports that remain. An empty cluster nobody acted on is removed.
+    pub fn delete_report(
+        &self,
+        receipt: &str,
+        token_hash: &str,
+        embedder: &dyn Embedder,
+    ) -> Result<bool> {
         let conn = self.conn();
         let row: Option<DeleteRow> = conn
             .query_row(
@@ -468,6 +488,10 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         Self::detach(&tx, id, cluster, &install, version.as_deref(), &raw)?;
         tx.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+        if let Some(cid) = cluster {
+            Self::refresh_fuzzy_content(&tx, cid, embedder)?;
+        }
+        Self::prune_empty(&tx)?;
         tx.commit()?;
         Ok(true)
     }
@@ -558,11 +582,43 @@ impl Db {
     }
 
     /// Drop clusters nothing points at, unless someone has acted on them.
-    pub fn prune_empty_clusters(&self) -> Result<usize> {
-        let conn = self.conn();
+    /// Runs inside the deleting transaction too, so a report deletion cannot
+    /// leave an empty cluster row (and its note-derived title) behind.
+    ///
+    /// The empty check looks at the reports themselves rather than the `count`
+    /// cache so rows left by older delete paths are repaired too. A cluster
+    /// kept because a human acted on it loses its note-derived title and
+    /// vector once its last report is gone, and install hashes with no report
+    /// behind them are dropped.
+    ///
+    /// A merged-away alias has no reports of its own, so it is neutralised
+    /// here too at the next prune; `merged_into` is untouched, so the redirect
+    /// still resolves to the live cluster.
+    fn prune_empty(conn: &Connection) -> Result<usize> {
+        conn.execute(
+            "DELETE FROM cluster_installs WHERE NOT EXISTS (
+                 SELECT 1 FROM reports r
+                 WHERE r.cluster_id = cluster_installs.cluster_id
+                   AND r.install_hash = cluster_installs.install_hash)",
+            [],
+        )?;
         let n = conn.execute(
-            "DELETE FROM clusters WHERE count = 0 AND status = 'new' AND issue_key IS NULL
+            "DELETE FROM clusters WHERE status = 'new' AND issue_key IS NULL
+               AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.cluster_id = clusters.id)
                AND NOT EXISTS (SELECT 1 FROM clusters m WHERE m.merged_into = clusters.id)",
+            [],
+        )?;
+        // Row-local on purpose: a merged-away alias owns no reports after the
+        // merge, so its title and vector are historical as soon as any of the
+        // moved reports is deleted. Fingerprint cluster titles come from the
+        // crash signature, not from a note, and are left alone.
+        conn.execute(
+            "UPDATE clusters SET title = kind || ' report for ' || app,
+                                 embedding = NULL, emb_n = 0, emb_model = NULL
+             WHERE fingerprint IS NULL
+               AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.cluster_id = clusters.id)
+               AND (title != kind || ' report for ' || app
+                    OR embedding IS NOT NULL OR emb_n != 0)",
             [],
         )?;
         conn.execute(
@@ -584,31 +640,202 @@ impl Db {
         Ok(n)
     }
 
-    /// Delete raw reports received before `cutoff_unix`. Returns the count.
-    pub fn purge_before(&self, cutoff_unix: u64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM reports WHERE received_at < ?1",
-            params![cutoff_unix as i64],
-        )?)
+    pub fn prune_empty_clusters(&self) -> Result<usize> {
+        Self::prune_empty(&self.conn())
+    }
+
+    /// Rebuild a fuzzy cluster's note-derived title and centroid from the raw
+    /// reports that still exist. When no reports are left the title becomes
+    /// neutral (it never repeats a deleted note) and the vector is dropped.
+    /// Fingerprint clusters get their title from the fingerprint, not from
+    /// user text, so they are left alone.
+    ///
+    /// The caller runs this after the removed rows are gone, so the survivors
+    /// are exactly the reports still in the cluster.
+    ///
+    /// Re-embedding happens inside the caller's write transaction, so the DB
+    /// mutex is held for as long as the configured embedder takes. Deletion
+    /// and retention are low-volume; dropping the vector instead would leave
+    /// the cluster unmatchable until the hourly re-embed pass, and keeping it
+    /// would leave the deleted report's text in the centroid. An embedder
+    /// failure therefore drops the vector and the deletion still succeeds.
+    fn refresh_fuzzy_content(conn: &Connection, id: i64, embedder: &dyn Embedder) -> Result<()> {
+        let row: Option<(Option<String>, Option<i64>, String, String)> = conn
+            .query_row(
+                "SELECT fingerprint, merged_into, app, kind FROM clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((fingerprint, merged_into, app, kind)) = row else {
+            return Ok(());
+        };
+        if fingerprint.is_some() || merged_into.is_some() {
+            return Ok(());
+        }
+        let raws: Vec<String> = conn
+            .prepare(
+                "SELECT raw FROM reports WHERE cluster_id = ?1 AND quarantined = 0 ORDER BY id",
+            )?
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let title = raws
+            .iter()
+            .find_map(|raw| {
+                serde_json::from_str::<crate::schema::Report>(raw)
+                    .ok()
+                    .map(|r| crate::embed::title_for(&r))
+            })
+            .unwrap_or_else(|| neutral_title(&app, &kind));
+        // A failing embedding service must not block a deletion, so an error
+        // drops the vector instead of keeping the one that still contains the
+        // deleted report's text, and leaves the model unset so a later pass
+        // rebuilds it from the survivors.
+        let mut vectors = Vec::new();
+        let mut complete = true;
+        for raw in &raws {
+            match crate::cluster::member_vector(embedder, raw) {
+                Ok(Some(v)) => vectors.push(v),
+                Ok(None) => {}
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        match (complete, centroid(&vectors)) {
+            (true, Some(c)) => conn.execute(
+                "UPDATE clusters SET title = ?2, embedding = ?3, emb_n = ?4, emb_model = ?5
+                 WHERE id = ?1",
+                params![
+                    id,
+                    title,
+                    crate::embed::to_bytes(&c),
+                    vectors.len() as i64,
+                    embedder.model()
+                ],
+            )?,
+            (true, None) => conn.execute(
+                "UPDATE clusters SET title = ?2, embedding = NULL, emb_n = 0, emb_model = ?3
+                 WHERE id = ?1",
+                params![id, title, embedder.model()],
+            )?,
+            (false, _) => conn.execute(
+                "UPDATE clusters SET title = ?2, embedding = NULL, emb_n = 0, emb_model = NULL
+                 WHERE id = ?1",
+                params![id, title],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Detach one stored report and delete its row, inside the caller's
+    /// transaction. Returns the cluster it belonged to.
+    ///
+    /// Fails closed when the row selected moments earlier is gone: the caller
+    /// counted it as deleted, so silently skipping detach would leave cluster
+    /// metadata behind. A missing cluster row already aborts in `detach`.
+    fn delete_stored(conn: &Connection, id: i64) -> Result<Option<i64>> {
+        let row: Option<DeleteRow> = conn
+            .query_row(
+                "SELECT id, token_hash, install_hash, cluster_id, app_version, raw
+                 FROM reports WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, _token, install, cluster, version, raw)) = row else {
+            anyhow::bail!("report {id} disappeared while deleting it");
+        };
+        Self::detach(conn, id, cluster, &install, version.as_deref(), &raw)?;
+        conn.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+        Ok(cluster)
+    }
+
+    /// Delete raw reports received before `cutoff_unix`, taking each one out
+    /// of its cluster first so no note-derived title, centroid contribution or
+    /// install hash survives the raw report. Returns the count.
+    pub fn purge_before(&self, cutoff_unix: u64, embedder: &dyn Embedder) -> Result<usize> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        // Ids only: a large purge must not hold every raw payload in memory.
+        let ids: Vec<i64> = tx
+            .prepare("SELECT id FROM reports WHERE received_at < ?1 ORDER BY id")?
+            .query_map(params![cutoff_unix as i64], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let count = ids.len();
+        let mut affected = std::collections::BTreeSet::new();
+        for id in ids {
+            if let Some(cid) = Self::delete_stored(&tx, id)? {
+                affected.insert(cid);
+            }
+        }
+        // Rebuild each touched cluster once, not once per removed report.
+        for cid in affected {
+            Self::refresh_fuzzy_content(&tx, cid, embedder)?;
+        }
+        Self::prune_empty(&tx)?;
+        tx.commit()?;
+        Ok(count)
     }
 
     /// Delete the oldest reports until at most `keep` remain.
-    pub fn trim_to(&self, keep: usize) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM reports WHERE id IN (
-                SELECT id FROM reports ORDER BY received_at ASC, id ASC
-                LIMIT max(0, (SELECT count(*) FROM reports) - ?1))",
-            params![keep as i64],
-        )?)
+    pub fn trim_to(&self, keep: usize, embedder: &dyn Embedder) -> Result<usize> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let total: i64 = tx.query_row("SELECT count(*) FROM reports", [], |r| r.get(0))?;
+        let excess = (total - keep as i64).max(0);
+        let ids: Vec<i64> = tx
+            .prepare("SELECT id FROM reports ORDER BY received_at ASC, id ASC LIMIT ?1")?
+            .query_map(params![excess], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let count = ids.len();
+        let mut affected = std::collections::BTreeSet::new();
+        for id in ids {
+            if let Some(cid) = Self::delete_stored(&tx, id)? {
+                affected.insert(cid);
+            }
+        }
+        for cid in affected {
+            Self::refresh_fuzzy_content(&tx, cid, embedder)?;
+        }
+        Self::prune_empty(&tx)?;
+        tx.commit()?;
+        Ok(count)
     }
 
-    /// Evict one oldest raw report. Retention/quota eviction preserves any
-    /// historical cluster aggregates supplied by the clustering layer.
-    pub fn evict_oldest(&self) -> Result<bool> {
-        Ok(self.conn().execute(
-            "DELETE FROM reports WHERE id = (SELECT id FROM reports ORDER BY received_at, id LIMIT 1)",
-            [],
-        )? > 0)
+    /// Evict one oldest raw report under the data-directory quota. Like every
+    /// other delete path it takes the report out of its cluster, so the title,
+    /// centroid and install hash do not outlive the raw row.
+    pub fn evict_oldest(&self, embedder: &dyn Embedder) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM reports ORDER BY received_at, id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        let cluster = Self::delete_stored(&tx, id)?;
+        if let Some(cid) = cluster {
+            Self::refresh_fuzzy_content(&tx, cid, embedder)?;
+        }
+        Self::prune_empty(&tx)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn report_count(&self) -> Result<usize> {
@@ -1252,8 +1479,9 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             .optional()?)
     }
 
-    /// Delete a report by id (admin action), keeping cluster counters right.
-    pub fn delete_report_by_id(&self, id: i64) -> Result<bool> {
+    /// Delete a report by id (admin action), keeping cluster counters right
+    /// and rebuilding any note-derived title and centroid from the survivors.
+    pub fn delete_report_by_id(&self, id: i64, embedder: &dyn Embedder) -> Result<bool> {
         let conn = self.conn();
         let row: Option<(String, Option<i64>, Option<String>, String)> = conn
             .query_row(
@@ -1268,6 +1496,10 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
         let tx = conn.unchecked_transaction()?;
         Self::detach(&tx, id, cluster, &install, version.as_deref(), &raw)?;
         tx.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+        if let Some(cid) = cluster {
+            Self::refresh_fuzzy_content(&tx, cid, embedder)?;
+        }
+        Self::prune_empty(&tx)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1323,6 +1555,31 @@ AND status IN ('promoted', 'regressed', 'investigating', 'new', 'fixed', 'dismis
             params![id, fp],
         )?;
         Ok(())
+    }
+
+    /// Test hook: a cluster's `(centroid, reports folded in, model)`.
+    #[doc(hidden)]
+    pub fn embedding_for_test(&self, id: i64) -> Result<Option<EmbeddingSnapshot>> {
+        let row: Option<(Option<Vec<u8>>, i64, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT embedding, emb_n, emb_model FROM clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(b, n, model)| (b.map(|b| crate::embed::from_bytes(&b)), n as u64, model)))
+    }
+
+    /// Test hook: the install hashes recorded against a cluster.
+    #[doc(hidden)]
+    pub fn cluster_installs_for_test(&self, id: i64) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let hashes = conn
+            .prepare("SELECT install_hash FROM cluster_installs WHERE cluster_id = ?1 ORDER BY install_hash")?
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(hashes)
     }
 
     /// Test hook: a report's row id for its receipt.

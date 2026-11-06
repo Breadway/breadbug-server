@@ -37,7 +37,7 @@ pub struct AppState {
     global: Limiter,
     in_flight: Arc<Semaphore>,
     symbols: SymbolStore,
-    embedder: Box<dyn Embedder>,
+    embedder: Arc<dyn Embedder>,
     rules: ScoreRules,
     login: Limiter,
     board: Option<BoardClient>,
@@ -115,19 +115,19 @@ fn load_rules(cfg: &Config) -> ScoreRules {
     }
 }
 
-fn make_embedder(cfg: &Config) -> Box<dyn Embedder> {
+fn make_embedder(cfg: &Config) -> Arc<dyn Embedder> {
     if let Some(url) = &cfg.embed_url {
         match HttpEmbedder::new(url, &cfg.embed_model) {
             Ok(e) => {
                 tracing::info!(model = e.model(), url = %url, "clustering uses the local embedding service");
-                return Box::new(e);
+                return Arc::new(e);
             }
             Err(e) => {
                 tracing::error!(error = %e, "embedding service unusable; using the built-in embedder")
             }
         }
     }
-    Box::new(HashEmbedder)
+    Arc::new(HashEmbedder)
 }
 
 pub fn now_unix() -> u64 {
@@ -298,7 +298,7 @@ fn store_report(s: &Arc<AppState>, body: &[u8], install_hash: &str) -> Result<Re
         // exceed a tiny quota; in that case fail without looping forever.
         s.db.compact()?;
         while db_too_big(s) {
-            if !s.db.evict_oldest()? {
+            if !s.db.evict_oldest(s.embedder.as_ref())? {
                 return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "storage is full"));
             }
             s.db.compact()?;
@@ -425,8 +425,9 @@ async fn delete_report(
     }
     let token_hash = sha256_hex(token.as_bytes());
     let db = s.db.clone();
+    let embedder = s.embedder.clone();
     let deleted = tokio::task::spawn_blocking(move || {
-        let ok = db.delete_report(&receipt, &token_hash)?;
+        let ok = db.delete_report(&receipt, &token_hash, embedder.as_ref())?;
         if ok {
             db.compact()?;
         }
@@ -794,7 +795,7 @@ pub fn maintain(s: &AppState) -> Result<usize> {
         Err(e) => tracing::error!(error = %e, "re-embedding stale clusters failed"),
     }
     let cutoff = now_unix().saturating_sub(s.cfg.retention.as_secs());
-    let purged = s.db.purge_before(cutoff)?;
+    let purged = s.db.purge_before(cutoff, s.embedder.as_ref())?;
     if purged > 0 {
         s.db.compact()?;
     }

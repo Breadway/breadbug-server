@@ -872,12 +872,12 @@ async fn quarantine_action(
                 }
                 Ok(true)
             }
-            "delete" => state.db.delete_report_by_id(id),
+            "delete" => state.db.delete_report_by_id(id, state.fuzzy().embedder),
             "ban" => {
                 let banned = state
                     .db
                     .ban_install_of_report(id, "quarantine review", now_unix())?;
-                let deleted = state.db.delete_report_by_id(id)?;
+                let deleted = state.db.delete_report_by_id(id, state.fuzzy().embedder)?;
                 Ok(banned && deleted)
             }
             _ => Ok(false),
