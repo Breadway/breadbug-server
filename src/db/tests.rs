@@ -262,6 +262,84 @@ fn purging_old_reports_detaches_them_and_prunes_empty_clusters() {
     assert!(db.cluster_installs_for_test(gone).unwrap().is_empty());
 }
 
+/// Assert a cluster kept only as a merge alias is neutral: no note text, no
+/// vector, no install hash, and its redirect still resolves to `live`.
+fn assert_neutral_alias(db: &Db, alias: i64, live: i64) {
+    let row = db.cluster(alias).unwrap().unwrap();
+    assert_eq!(row.merged_into, Some(live));
+    assert_eq!(row.title, "behavior report for clip");
+    assert!(!row.title.contains("clipboard"));
+    assert!(!row.title.contains("scratchpad"));
+    let (embedding, n, _) = db.embedding_for_test(alias).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
+    assert!(db.cluster_installs_for_test(alias).unwrap().is_empty());
+    assert_eq!(db.resolve_cluster_id(alias).unwrap(), live);
+}
+
+#[test]
+fn deleting_reports_neutralises_a_merged_away_cluster() {
+    let db = Db::open_memory().unwrap();
+    let note_a = "clipboard hangs when I paste a large image";
+    let note_b = "scratchpad notes vanish after closing the window";
+    let a = fuzzy_cluster(&db, &[("rA", "installA", note_a, 100)]);
+    let b = fuzzy_cluster(&db, &[("rB", "installB", note_b, 200)]);
+    assert!(db.set_issue(a, "BUG-20").unwrap());
+    assert!(db.merge_clusters(a, b).unwrap());
+    assert_eq!(db.cluster(a).unwrap().unwrap().merged_into, Some(b));
+
+    // rA moved into b, so deleting it leaves the alias with no reports of its
+    // own even though b still has one. The alias must lose the note anyway.
+    assert!(db.delete_report("rA", "tokenhash", &HashEmbedder).unwrap());
+    assert_neutral_alias(&db, a, b);
+    assert_eq!(
+        db.cluster(a).unwrap().unwrap().issue_key.as_deref(),
+        Some("BUG-20")
+    );
+    let live = db.cluster(b).unwrap().unwrap();
+    assert_eq!(live.title, note_b);
+    assert_eq!(db.embedding_for_test(b).unwrap().unwrap().1, 1);
+
+    // Emptying the canonical cluster must not break the redirect to it; b is
+    // kept because the alias still points there.
+    assert!(db.delete_report("rB", "tokenhash", &HashEmbedder).unwrap());
+    assert_neutral_alias(&db, a, b);
+    let live = db.cluster(b).unwrap().unwrap();
+    assert_eq!(live.title, "behavior report for clip");
+    let (embedding, n, _) = db.embedding_for_test(b).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
+    assert!(db.cluster_installs_for_test(b).unwrap().is_empty());
+    assert!(db.raw_of("rA").unwrap().is_none());
+    assert!(db.raw_of("rB").unwrap().is_none());
+}
+
+#[test]
+fn purging_reports_neutralises_a_merged_away_cluster() {
+    let db = Db::open_memory().unwrap();
+    let note_a = "clipboard hangs when I paste a large image";
+    let note_b = "scratchpad notes vanish after closing the window";
+    let a = fuzzy_cluster(&db, &[("rA", "installA", note_a, 100)]);
+    let b = fuzzy_cluster(&db, &[("rB", "installB", note_b, 200)]);
+    assert!(db.set_issue(a, "BUG-21").unwrap());
+    assert!(db.merge_clusters(a, b).unwrap());
+
+    assert_eq!(db.purge_before(300, &HashEmbedder).unwrap(), 2);
+
+    assert_neutral_alias(&db, a, b);
+    assert_eq!(
+        db.cluster(a).unwrap().unwrap().issue_key.as_deref(),
+        Some("BUG-21")
+    );
+    let live = db.cluster(b).unwrap().unwrap();
+    assert_eq!(live.title, "behavior report for clip");
+    let (embedding, n, _) = db.embedding_for_test(b).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
+    assert!(db.cluster_installs_for_test(b).unwrap().is_empty());
+    assert!(db.report_count().unwrap() == 0);
+}
+
 #[test]
 fn maintenance_repairs_content_left_by_older_delete_paths() {
     let db = Db::open_memory().unwrap();

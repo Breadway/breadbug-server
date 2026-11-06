@@ -590,6 +590,10 @@ impl Db {
     /// kept because a human acted on it loses its note-derived title and
     /// vector once its last report is gone, and install hashes with no report
     /// behind them are dropped.
+    ///
+    /// A merged-away alias has no reports of its own, so it is neutralised
+    /// here too at the next prune; `merged_into` is untouched, so the redirect
+    /// still resolves to the live cluster.
     fn prune_empty(conn: &Connection) -> Result<usize> {
         conn.execute(
             "DELETE FROM cluster_installs WHERE NOT EXISTS (
@@ -604,10 +608,14 @@ impl Db {
                AND NOT EXISTS (SELECT 1 FROM clusters m WHERE m.merged_into = clusters.id)",
             [],
         )?;
+        // Row-local on purpose: a merged-away alias owns no reports after the
+        // merge, so its title and vector are historical as soon as any of the
+        // moved reports is deleted. Fingerprint cluster titles come from the
+        // crash signature, not from a note, and are left alone.
         conn.execute(
             "UPDATE clusters SET title = kind || ' report for ' || app,
                                  embedding = NULL, emb_n = 0, emb_model = NULL
-             WHERE fingerprint IS NULL AND merged_into IS NULL
+             WHERE fingerprint IS NULL
                AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.cluster_id = clusters.id)
                AND (title != kind || ' report for ' || app
                     OR embedding IS NOT NULL OR emb_n != 0)",
@@ -644,6 +652,13 @@ impl Db {
     ///
     /// The caller runs this after the removed rows are gone, so the survivors
     /// are exactly the reports still in the cluster.
+    ///
+    /// Re-embedding happens inside the caller's write transaction, so the DB
+    /// mutex is held for as long as the configured embedder takes. Deletion
+    /// and retention are low-volume; dropping the vector instead would leave
+    /// the cluster unmatchable until the hourly re-embed pass, and keeping it
+    /// would leave the deleted report's text in the centroid. An embedder
+    /// failure therefore drops the vector and the deletion still succeeds.
     fn refresh_fuzzy_content(conn: &Connection, id: i64, embedder: &dyn Embedder) -> Result<()> {
         let row: Option<(Option<String>, Option<i64>, String, String)> = conn
             .query_row(
@@ -716,6 +731,10 @@ impl Db {
 
     /// Detach one stored report and delete its row, inside the caller's
     /// transaction. Returns the cluster it belonged to.
+    ///
+    /// Fails closed when the row selected moments earlier is gone: the caller
+    /// counted it as deleted, so silently skipping detach would leave cluster
+    /// metadata behind. A missing cluster row already aborts in `detach`.
     fn delete_stored(conn: &Connection, id: i64) -> Result<Option<i64>> {
         let row: Option<DeleteRow> = conn
             .query_row(
@@ -735,7 +754,7 @@ impl Db {
             )
             .optional()?;
         let Some((id, _token, install, cluster, version, raw)) = row else {
-            return Ok(None);
+            anyhow::bail!("report {id} disappeared while deleting it");
         };
         Self::detach(conn, id, cluster, &install, version.as_deref(), &raw)?;
         conn.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
