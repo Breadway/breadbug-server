@@ -676,8 +676,7 @@ async fn merge(
         // Fold the moved reports into the survivor's vector. Without this,
         // the wording that was just merged in still matches nothing and the
         // same duplicate starts a fresh cluster next time.
-        if let Err(e) = crate::cluster::reembed_cluster(&state.db, state.fuzzy().embedder, target)
-        {
+        if let Err(e) = crate::cluster::reembed_cluster(&state.db, state.fuzzy().embedder, target) {
             tracing::error!(error = %e, "reembed after merge failed");
         }
         Ok(Some(target))
@@ -873,12 +872,12 @@ async fn quarantine_action(
                 }
                 Ok(true)
             }
-            "delete" => state.db.delete_report_by_id(id),
+            "delete" => state.db.delete_report_by_id(id, state.fuzzy().embedder),
             "ban" => {
                 let banned = state
                     .db
                     .ban_install_of_report(id, "quarantine review", now_unix())?;
-                let deleted = state.db.delete_report_by_id(id)?;
+                let deleted = state.db.delete_report_by_id(id, state.fuzzy().embedder)?;
                 Ok(banned && deleted)
             }
             _ => Ok(false),

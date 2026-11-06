@@ -106,6 +106,21 @@ fn assign_fuzzy(
     }
 }
 
+/// What one stored report contributes to its fuzzy cluster's centroid, or
+/// `None` when it has too little text to have been clustered on. Used when a
+/// deleted report has to be taken back out of the centroid: the survivors are
+/// re-embedded exactly as `assign_fuzzy` would have embedded them.
+pub(crate) fn member_vector(embedder: &dyn Embedder, raw: &str) -> Result<Option<Vec<f32>>> {
+    let Ok(report) = serde_json::from_str::<Report>(raw) else {
+        return Ok(None);
+    };
+    let text = report_text(&report);
+    if meaningful(&text) < MIN_TOKENS {
+        return Ok(None);
+    }
+    Ok(Some(embedder.embed(&text)?))
+}
+
 /// Recompute one fuzzy cluster's centroid from its stored reports. Used when
 /// the embedding model changes and after a manual merge, so the survivor can
 /// match the wording that was just folded into it. Fingerprint clusters have

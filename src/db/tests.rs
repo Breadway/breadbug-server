@@ -1,4 +1,6 @@
 use super::*;
+use crate::embed::{cosine, report_text, title_for, Embedder, HashEmbedder};
+use crate::schema::Report;
 
 fn sample<'a>(receipt: &'a str, install: &'a str, sha: &'a str, at: u64) -> NewReport<'a> {
     NewReport {
@@ -35,10 +37,12 @@ fn insert_find_duplicate_and_status() {
 fn delete_needs_the_right_token_and_really_deletes() {
     let db = Db::open_memory().unwrap();
     db.insert_report(&sample("r1", "i1", "s1", 100)).unwrap();
-    assert!(!db.delete_report("r1", "wrong").unwrap());
-    assert!(!db.delete_report("missing", "tokenhash").unwrap());
+    assert!(!db.delete_report("r1", "wrong", &HashEmbedder).unwrap());
+    assert!(!db
+        .delete_report("missing", "tokenhash", &HashEmbedder)
+        .unwrap());
     assert_eq!(db.report_count().unwrap(), 1);
-    assert!(db.delete_report("r1", "tokenhash").unwrap());
+    assert!(db.delete_report("r1", "tokenhash", &HashEmbedder).unwrap());
     assert_eq!(db.report_count().unwrap(), 0);
     assert!(db.raw_of("r1").unwrap().is_none());
 }
@@ -50,14 +54,14 @@ fn purge_and_trim() {
         db.insert_report(&sample(&format!("r{i}"), "i", &format!("s{i}"), 100 + i))
             .unwrap();
     }
-    assert_eq!(db.purge_before(105).unwrap(), 5);
+    assert_eq!(db.purge_before(105, &HashEmbedder).unwrap(), 5);
     assert_eq!(db.report_count().unwrap(), 5);
-    assert_eq!(db.trim_to(2).unwrap(), 3);
+    assert_eq!(db.trim_to(2, &HashEmbedder).unwrap(), 3);
     assert_eq!(db.report_count().unwrap(), 2);
     // the newest survive
     assert!(db.status_of("r9").unwrap().is_some());
     assert!(db.status_of("r5").unwrap().is_none());
-    assert_eq!(db.trim_to(100).unwrap(), 0);
+    assert_eq!(db.trim_to(100, &HashEmbedder).unwrap(), 0);
 }
 
 #[test]
@@ -70,6 +74,227 @@ fn migrations_are_idempotent_on_disk() {
     }
     let db = Db::open(&p).unwrap();
     assert_eq!(db.report_count().unwrap(), 1);
+}
+
+fn report_json(note: &str) -> String {
+    serde_json::json!({
+        "schema": 1,
+        "report_type": "behavior",
+        "created_unix": 1,
+        "app": {"id": "clip", "version": "0.3"},
+        "notes": note,
+    })
+    .to_string()
+}
+
+fn vector_of(raw: &str) -> Vec<f32> {
+    let report: Report = serde_json::from_str(raw).unwrap();
+    HashEmbedder.embed(&report_text(&report)).unwrap()
+}
+
+/// Store clean reports in one fuzzy cluster, as intake would, and leave a
+/// centroid covering all of them. `(receipt, install, note, at)` per report.
+fn fuzzy_cluster(db: &Db, members: &[(&str, &str, &str, u64)]) -> i64 {
+    let mut cid: Option<i64> = None;
+    let mut vectors = Vec::new();
+    for &(receipt, install, note, at) in members {
+        let raw = report_json(note);
+        let id = db
+            .insert_report(&NewReport {
+                receipt,
+                token_hash: "tokenhash",
+                install_hash: install,
+                payload_sha: receipt,
+                received_at: at,
+                app: "clip",
+                app_version: Some("0.3"),
+                report_type: "behavior",
+                quarantined: false,
+                rescrub_hits: "{}",
+                raw: &raw,
+            })
+            .unwrap();
+        let report: Report = serde_json::from_str(&raw).unwrap();
+        let c = Contribution {
+            report_id: id,
+            install_hash: install,
+            version: Some("0.3"),
+            os_build: None,
+            at,
+        };
+        cid = Some(match cid {
+            Some(existing) => db.assign_to(existing, &c).unwrap(),
+            None => db
+                .new_cluster("clip", "behavior", &title_for(&report), &c)
+                .unwrap(),
+        });
+        vectors.push(HashEmbedder.embed(&report_text(&report)).unwrap());
+    }
+    let cid = cid.unwrap();
+    let c = crate::embed::centroid(&vectors).unwrap();
+    db.set_embedding(cid, &c, vectors.len() as u64, HashEmbedder.model())
+        .unwrap();
+    cid
+}
+
+fn assert_close(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    assert!(
+        cosine(actual, expected) > 0.999_99,
+        "centroid {actual:?} does not match {expected:?}"
+    );
+}
+
+#[test]
+fn deleting_one_report_rebuilds_title_centroid_and_installs() {
+    let db = Db::open_memory().unwrap();
+    let note_a = "clipboard hangs when I paste a large image";
+    let note_b = "scratchpad notes vanish after closing the window";
+    let cid = fuzzy_cluster(
+        &db,
+        &[
+            ("rA", "installA", note_a, 100),
+            ("rB", "installB", note_b, 200),
+        ],
+    );
+    let before = db.cluster(cid).unwrap().unwrap();
+    assert_eq!(before.title, note_a);
+
+    assert!(db.delete_report("rA", "tokenhash", &HashEmbedder).unwrap());
+
+    let after = db.cluster(cid).unwrap().unwrap();
+    assert_eq!(after.title, note_b);
+    assert!(!after.title.contains("clipboard"));
+    assert_eq!((after.count, after.installs), (1, 1));
+    assert_eq!(
+        db.cluster_installs_for_test(cid).unwrap(),
+        vec!["installB".to_string()]
+    );
+    let (embedding, n, model) = db.embedding_for_test(cid).unwrap().unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(model.as_deref(), Some("hash-v1-256"));
+    assert_close(&embedding.unwrap(), &vector_of(&report_json(note_b)));
+    assert!(db.raw_of("rA").unwrap().is_none());
+}
+
+#[test]
+fn deleting_the_last_report_removes_an_unacted_cluster() {
+    let db = Db::open_memory().unwrap();
+    let note = "clipboard hangs when I paste a large image";
+    let cid = fuzzy_cluster(&db, &[("r1", "install1", note, 100)]);
+
+    assert!(db.delete_report("r1", "tokenhash", &HashEmbedder).unwrap());
+
+    assert!(db.cluster(cid).unwrap().is_none());
+    assert!(db.cluster_installs_for_test(cid).unwrap().is_empty());
+    assert_eq!(db.report_count().unwrap(), 0);
+}
+
+#[test]
+fn last_report_deletion_keeps_a_promoted_link_without_its_note() {
+    let db = Db::open_memory().unwrap();
+    let note = "clipboard hangs when I paste a large image";
+    let cid = fuzzy_cluster(&db, &[("r1", "install1", note, 100)]);
+    assert!(db.set_issue(cid, "BUG-1").unwrap());
+
+    assert!(db.delete_report("r1", "tokenhash", &HashEmbedder).unwrap());
+
+    let kept = db.cluster(cid).unwrap().unwrap();
+    assert_eq!(kept.issue_key.as_deref(), Some("BUG-1"));
+    assert_eq!(kept.status, "promoted");
+    assert_eq!(kept.title, "behavior report for clip");
+    assert!(!kept.title.contains("clipboard"));
+    let (embedding, n, _) = db.embedding_for_test(cid).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
+    assert!(db.cluster_installs_for_test(cid).unwrap().is_empty());
+}
+
+#[test]
+fn purging_old_reports_detaches_them_and_prunes_empty_clusters() {
+    let db = Db::open_memory().unwrap();
+    let note_a = "clipboard hangs when I paste a large image";
+    let note_b = "scratchpad notes vanish after closing the window";
+    let cid = fuzzy_cluster(
+        &db,
+        &[
+            ("rA", "installA", note_a, 100),
+            ("rB", "installB", note_b, 200),
+        ],
+    );
+    // A cluster acted on before the cutoff must keep its link, but not the
+    // note. A cluster nobody acted on must disappear entirely.
+    let old_note = "lock screen rejects the correct password sometimes";
+    let acted = fuzzy_cluster(&db, &[("rC", "installC", old_note, 100)]);
+    assert!(db.set_issue(acted, "BUG-2").unwrap());
+    let gone_note = "notification banner never disappears from the panel";
+    let gone = fuzzy_cluster(&db, &[("rD", "installD", gone_note, 100)]);
+
+    assert_eq!(db.purge_before(150, &HashEmbedder).unwrap(), 3);
+
+    let survivor = db.cluster(cid).unwrap().unwrap();
+    assert_eq!(survivor.title, note_b);
+    assert!(!survivor.title.contains("clipboard"));
+    assert_eq!((survivor.count, survivor.installs), (1, 1));
+    assert_eq!(
+        db.cluster_installs_for_test(cid).unwrap(),
+        vec!["installB".to_string()]
+    );
+    let (embedding, n, model) = db.embedding_for_test(cid).unwrap().unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(model.as_deref(), Some("hash-v1-256"));
+    assert_close(&embedding.unwrap(), &vector_of(&report_json(note_b)));
+
+    assert!(db.raw_of("rA").unwrap().is_none());
+    assert!(db.raw_of("rC").unwrap().is_none());
+    assert!(db.raw_of("rD").unwrap().is_none());
+
+    let kept = db.cluster(acted).unwrap().unwrap();
+    assert_eq!(kept.issue_key.as_deref(), Some("BUG-2"));
+    assert_eq!(kept.title, "behavior report for clip");
+    assert!(!kept.title.contains("password"));
+    let (embedding, n, _) = db.embedding_for_test(acted).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
+    assert!(db.cluster_installs_for_test(acted).unwrap().is_empty());
+
+    assert!(db.cluster(gone).unwrap().is_none());
+    assert!(db.cluster_installs_for_test(gone).unwrap().is_empty());
+}
+
+#[test]
+fn maintenance_repairs_content_left_by_older_delete_paths() {
+    let db = Db::open_memory().unwrap();
+    let note = "clipboard hangs when I paste a large image";
+    let unacted = fuzzy_cluster(&db, &[("r1", "install1", note, 100)]);
+    let acted_note = "lock screen rejects the correct password sometimes";
+    let acted = fuzzy_cluster(&db, &[("r2", "install2", acted_note, 100)]);
+    assert!(db.set_issue(acted, "BUG-3").unwrap());
+
+    // `detach_report` models the old delete paths: the raw row is no longer
+    // in the cluster but its note-derived title and vector were never rebuilt.
+    for receipt in ["r1", "r2"] {
+        let id = db.report_id_for_test(receipt).unwrap().unwrap();
+        let stored = db
+            .clusterable_reports()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        db.detach_report(&stored).unwrap();
+    }
+    assert_eq!(db.cluster(acted).unwrap().unwrap().title, acted_note);
+
+    db.prune_empty_clusters().unwrap();
+
+    assert!(db.cluster(unacted).unwrap().is_none());
+    let kept = db.cluster(acted).unwrap().unwrap();
+    assert_eq!(kept.issue_key.as_deref(), Some("BUG-3"));
+    assert_eq!(kept.title, "behavior report for clip");
+    assert!(!kept.title.contains("password"));
+    let (embedding, n, _) = db.embedding_for_test(acted).unwrap().unwrap();
+    assert!(embedding.is_none());
+    assert_eq!(n, 0);
 }
 
 fn row() -> ClusterRow {
