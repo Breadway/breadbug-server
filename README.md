@@ -115,6 +115,14 @@ consistent backup API, deletes expired raw rows in the backup, securely clears
 freed pages and vacuums before atomic replacement. Keep exactly one generation
 at the destination. Never copy a live database or its WAL as a backup.
 
+Expiry inside the snapshot detaches the reports from their clusters before
+deleting them: cluster counters, versions and OS builds are rebuilt from the
+survivors, a fuzzy cluster's title is regenerated from its oldest survivor (or
+neutralised), install hashes with no surviving report are dropped and empty
+clusters nobody acted on are removed. A fuzzy centroid that included an
+expired report is cleared instead of recomputed, because per-report vectors
+are not stored in the database.
+
 Deleting a report (by receipt, by an admin, or by retention purge) first takes
 it out of its cluster, so a note-derived cluster title, its embedding centroid
 and its install hash do not outlive the raw row. Clusters a human acted on keep
