@@ -199,13 +199,11 @@ pub fn normalize_message(msg: &str) -> String {
 }
 
 /// The marker a crash cluster is built from: the newest panic or crash with
-/// frames or a message.
+/// frames or a message. Freeze, recovered and stopped markers never qualify,
+/// so a stopped marker recorded when a frozen app exits cannot turn a report
+/// into a crash cluster or change its fingerprint.
 fn problem_marker(report: &Report) -> Option<&Marker> {
-    report
-        .markers
-        .iter()
-        .rev()
-        .find(|m| matches!(m.kind, MarkerKind::Panic | MarkerKind::Crash))
+    report.markers.iter().rev().find(|m| m.kind.is_problem())
 }
 
 /// Fingerprint a report, or `None` when there is nothing stable to hash
@@ -244,8 +242,11 @@ pub fn fingerprint(report: &Report) -> Option<Fingerprint> {
         return None;
     }
     let kind = match marker.map(|m| m.kind) {
-        Some(_) => "crash",
-        None => "freeze",
+        Some(MarkerKind::Panic | MarkerKind::Crash) => "crash",
+        // `problem_marker` only returns panic and crash markers. The other
+        // kinds are listed explicitly so a new marker kind has to be
+        // classified here instead of silently counting as a crash.
+        Some(MarkerKind::Freeze | MarkerKind::Recovered | MarkerKind::Stopped) | None => "freeze",
     };
     let material = format!(
         "v{RULES_VERSION}|{}|{kind}|{}|{location}|{message}",

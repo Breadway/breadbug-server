@@ -79,6 +79,26 @@ async fn real_client_report_is_accepted_and_stored_unchanged() {
 }
 
 #[tokio::test]
+async fn old_client_report_with_a_stopped_marker_is_accepted() {
+    let h = harness(|_| {});
+    let mut v: Value = serde_json::from_str(FIXTURE).unwrap();
+    v["report_type"] = json!("freeze");
+    v["markers"] = json!([
+        { "t": 1008, "kind": "freeze", "message": "no heartbeat for 20s" },
+        { "t": 1030, "kind": "stopped" }
+    ]);
+    let body = serde_json::to_vec(&v).unwrap();
+    let (status, _, reply) = call(&h, ok_post(&body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{reply}");
+    let receipt = reply["receipt"].as_str().unwrap();
+    // Stored as sent, so the older client's report is not silently altered.
+    let stored: Value =
+        serde_json::from_str(&h.state.db.raw_of(receipt).unwrap().unwrap()).unwrap();
+    assert_eq!(stored["markers"][1]["kind"], json!("stopped"));
+    assert_eq!(stored, v);
+}
+
+#[tokio::test]
 async fn bad_requests_are_rejected_cleanly() {
     let h = harness(|_| {});
     let b = FIXTURE.as_bytes();
