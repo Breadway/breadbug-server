@@ -203,6 +203,47 @@ fn freeze_uses_the_live_stack_and_no_evidence_means_no_fingerprint() {
 }
 
 #[test]
+fn stopped_marker_does_not_become_a_problem_marker() {
+    // An older client can add a stopped marker when a frozen app exits. It
+    // must not change the fingerprint or turn a freeze report into a crash.
+    let freeze = |markers: serde_json::Value| {
+        report(json!({
+            "report_type": "freeze",
+            "markers": markers,
+            "live_stack": [{"symbol": "clip::clipboard::wait_for_selection"}]
+        }))
+    };
+    let with_stopped = freeze(json!([
+        {"t": 1, "kind": "freeze", "message": "no heartbeat for 20s"},
+        {"t": 30, "kind": "stopped"}
+    ]));
+    let without_stopped = freeze(json!([
+        {"t": 1, "kind": "freeze", "message": "no heartbeat for 20s"}
+    ]));
+    let a = fingerprint(&with_stopped).unwrap();
+    let b = fingerprint(&without_stopped).unwrap();
+    assert_eq!(a.key, b.key);
+    assert_eq!(a.title, b.title);
+
+    // The newest marker being stopped must not hide the panic before it.
+    let panic_then_stopped = report(json!({
+        "markers": [
+            {"t": 1, "kind": "panic", "message": "boom", "frames": [{"symbol": "clip::run"}]},
+            {"t": 30, "kind": "stopped"}
+        ]
+    }));
+    let panic_only = report(panic_marker(json!([{"symbol": "clip::run"}]), "", "boom"));
+    assert_eq!(
+        fingerprint(&panic_then_stopped).unwrap().key,
+        fingerprint(&panic_only).unwrap().key
+    );
+
+    // On its own it is not evidence, so it builds no crash cluster.
+    let alone = report(json!({"markers": [{"t": 30, "kind": "stopped"}]}));
+    assert!(fingerprint(&alone).is_none());
+}
+
+#[test]
 fn title_prefers_the_message() {
     let r = report(panic_marker(
         json!([{"symbol": "clip::a"}]),
