@@ -54,6 +54,24 @@ pub enum MarkerKind {
     Crash,
     Freeze,
     Recovered,
+    /// A frozen app exited. `breadd` records this for its own bookkeeping and
+    /// older clients included it in the report they queued. It is accepted and
+    /// stored so those reports are not rejected and lost, but it is not a
+    /// panic, crash or freeze signal and never builds or joins a cluster.
+    #[serde(rename = "stopped")]
+    Stopped,
+}
+
+impl MarkerKind {
+    /// Whether this marker is the evidence a crash cluster is built from. Only
+    /// a panic or crash carries the frames, location and message a fingerprint
+    /// hashes. Freeze, recovered and stopped markers are bookkeeping.
+    pub fn is_problem(self) -> bool {
+        match self {
+            Self::Panic | Self::Crash => true,
+            Self::Freeze | Self::Recovered | Self::Stopped => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

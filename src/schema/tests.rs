@@ -48,6 +48,30 @@ fn bad_types_and_values_are_rejected() {
 }
 
 #[test]
+fn stopped_marker_is_accepted_and_round_trips() {
+    let mut v = minimal();
+    v["report_type"] = json!("freeze");
+    v["markers"] = json!([
+        { "t": 10, "kind": "freeze", "message": "no heartbeat for 20s" },
+        { "t": 30, "kind": "stopped" }
+    ]);
+    let report = parse(&v).expect("a stopped marker must not reject the report");
+    assert_eq!(report.markers[1].kind, MarkerKind::Stopped);
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["markers"][1]["kind"], json!("stopped"));
+    let again = Report::parse(&serde_json::to_vec(&wire).unwrap(), 2000).unwrap();
+    assert_eq!(again.markers[1].kind, MarkerKind::Stopped);
+}
+
+#[test]
+fn unknown_marker_kind_is_still_rejected() {
+    let mut v = minimal();
+    v["markers"] = json!([{ "t": 1, "kind": "lingering" }]);
+    let err = parse(&v).expect_err("an unknown marker kind must still be rejected");
+    assert!(err.contains("unknown variant"), "{err}");
+}
+
+#[test]
 fn size_limits_apply() {
     let long = "x".repeat(MAX_STR + 1);
     let mut v = minimal();
