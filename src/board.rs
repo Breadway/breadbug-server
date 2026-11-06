@@ -61,18 +61,44 @@ pub struct BoardClient {
     projects: HashMap<String, String>,
 }
 
-fn base_ok(url: &str) -> bool {
-    url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost")
+/// Parse the configured board URL into the base used for requests.
+///
+/// `https` is accepted for any host. Plain `http` is accepted only for a
+/// literal loopback host: IPv4 `127.0.0.1`, IPv6 `::1`, or the exact name
+/// `localhost`. Userinfo, other schemes, query strings and fragments are
+/// rejected, as are hostnames that merely start with `localhost` or
+/// `127.0.0.1` (`localhost.evil.example`, `127.0.0.1.evil.example`,
+/// `localhost@evil.example`). The returned string comes from the parsed URL,
+/// so the value that was checked is the value that is used.
+fn parse_base(url: &str) -> Result<String> {
+    let bad = || anyhow!("breadboard URL must be https (got {url})");
+    let parsed = url::Url::parse(url).map_err(|_| bad())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(bad());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(bad());
+    }
+    let host = parsed.host().ok_or_else(bad)?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if loopback_host(&host) => {}
+        _ => return Err(bad()),
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn loopback_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => *ip == std::net::Ipv4Addr::LOCALHOST,
+        url::Host::Ipv6(ip) => *ip == std::net::Ipv6Addr::LOCALHOST,
+        url::Host::Domain(name) => *name == "localhost",
+    }
 }
 
 impl BoardClient {
     pub fn new(base: &str, token: &str, projects: HashMap<String, String>) -> Result<Self> {
-        let base = base.trim_end_matches('/').to_string();
-        if !base_ok(&base) {
-            bail!("breadboard URL must be https (got {base})");
-        }
+        let base = parse_base(base)?;
         if token.trim().is_empty() {
             bail!("breadboard token is empty");
         }
@@ -268,11 +294,95 @@ mod tests {
     }
 
     #[test]
-    fn client_requires_https_and_a_token() {
-        assert!(BoardClient::new("http://board.example.com", "t", default_projects()).is_err());
+    fn client_requires_a_token() {
         assert!(BoardClient::new("https://board.example.com", "", default_projects()).is_err());
+        assert!(BoardClient::new("https://board.example.com", "  ", default_projects()).is_err());
         assert!(BoardClient::new("https://board.example.com/", "t", default_projects()).is_ok());
-        assert!(BoardClient::new("http://127.0.0.1:1", "t", default_projects()).is_ok());
+    }
+
+    #[test]
+    fn board_base_accepts_https_anywhere_and_http_only_on_literal_loopback() {
+        for good in [
+            "https://board.example.com",
+            "https://board.example.com/",
+            "https://board.example.com/api",
+            "https://board.example.com/api/",
+            "http://localhost",
+            "http://localhost/",
+            "http://localhost:8120",
+            "http://127.0.0.1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:8120/",
+            "http://[::1]:8120",
+            "http://[::1]:8120/",
+        ] {
+            assert!(
+                BoardClient::new(good, "t", default_projects()).is_ok(),
+                "{good} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn board_base_rejects_lookalike_hosts_userinfo_and_other_schemes() {
+        for bad in [
+            // BUG-44 probes.
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost@evil.example",
+            // Other lookalikes and non-loopback plain http.
+            "http://localhost.evil.example:8120/",
+            "http://127.0.0.1.evil.example:8120",
+            "http://board.example.com",
+            "http://0.0.0.0:8120",
+            "http://[::2]:8120",
+            // Userinfo is rejected everywhere, including on loopback and https.
+            "http://user:pass@localhost:8120",
+            "http://user@127.0.0.1:8120",
+            "https://user@board.example.com",
+            "https://user:pass@board.example.com",
+            // Other schemes and non-URLs.
+            "ftp://board.example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "board.example.com",
+            "",
+            "https://",
+        ] {
+            assert!(
+                BoardClient::new(bad, "t", default_projects()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn board_base_rejects_query_and_fragment() {
+        for bad in [
+            "https://board.example.com/?a=1",
+            "https://board.example.com/#frag",
+            "http://localhost:8120/?a=1",
+        ] {
+            assert!(
+                BoardClient::new(bad, "t", default_projects()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn board_base_is_built_from_the_parsed_url() {
+        let b = BoardClient::new("HTTPS://Board.Example.COM/api//", "t", default_projects())
+            .expect("uppercase https URL should be accepted");
+        assert_eq!(b.base, "https://board.example.com/api");
+
+        let b = BoardClient::new("http://127.0.0.1:80/", "t", default_projects())
+            .expect("loopback http URL should be accepted");
+        assert_eq!(b.base, "http://127.0.0.1");
+
+        let b = BoardClient::new("http://[::1]:8120/", "t", default_projects())
+            .expect("IPv6 loopback http URL should be accepted");
+        assert_eq!(b.base, "http://[::1]:8120");
     }
 
     #[test]
