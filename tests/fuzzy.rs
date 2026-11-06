@@ -214,21 +214,12 @@ async fn a_model_switch_reembeds_only_stale_clusters() {
     )
     .await;
     assert_eq!(
-        st.db
-            .stale_fuzzy_cluster_ids("hash-v1-256")
-            .unwrap()
-            .len(),
+        st.db.stale_fuzzy_cluster_ids("hash-v1-256").unwrap().len(),
         0
     );
-    assert_eq!(
-        st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(),
-        1
-    );
+    assert_eq!(st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(), 1);
     assert_eq!(reembed_stale(&st.db, &Other).unwrap(), 1);
-    assert_eq!(
-        st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(),
-        0
-    );
+    assert_eq!(st.db.stale_fuzzy_cluster_ids("other-v2").unwrap().len(), 0);
     assert_eq!(reembed_stale(&st.db, &Other).unwrap(), 0);
 }
 

@@ -676,8 +676,7 @@ async fn merge(
         // Fold the moved reports into the survivor's vector. Without this,
         // the wording that was just merged in still matches nothing and the
         // same duplicate starts a fresh cluster next time.
-        if let Err(e) = crate::cluster::reembed_cluster(&state.db, state.fuzzy().embedder, target)
-        {
+        if let Err(e) = crate::cluster::reembed_cluster(&state.db, state.fuzzy().embedder, target) {
             tracing::error!(error = %e, "reembed after merge failed");
         }
         Ok(Some(target))
