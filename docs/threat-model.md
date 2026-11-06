@@ -30,6 +30,10 @@ report here later does not edit an issue that was already filed.
 
 Backup privacy: `packaging/backup.py` removes expired raw payloads from a
 consistent snapshot and compacts it before replacing the single backup
-generation. Explicit deletion reaches backups on the next successful rotation,
-not instantly. Operators must monitor rotation and independently expire any
-external snapshots. The server does not erase unmanaged backup copies.
+generation. Expiry runs the same cluster detach as a live delete: titles are
+regenerated or neutralised and install hashes are dropped. A fuzzy centroid
+that included an expired report is cleared rather than recomputed, because
+per-report vectors are not stored. Explicit deletion reaches backups on the
+next successful rotation, not instantly. Operators must monitor rotation and
+independently expire any external snapshots. The server does not erase
+unmanaged backup copies.
