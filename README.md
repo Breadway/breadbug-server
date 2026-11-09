@@ -79,9 +79,9 @@ Checklist (nothing here is done by CI):
    mounted read-only), a `.env` with `BREADBUG_ADMIN_TOKEN_SHA256`
    (`printf '%s' "$TOKEN" | sha256sum`), optionally the breadboard URL and a
    token file.
-3. `docker compose -f packaging/docker-compose.yml up -d --build`. This also
-   starts the `breadbug-embed` sentence-embedding sidecar (CPU, no published
-   port, model cached in a named volume). Check
+3. `docker compose -f packaging/docker-compose.yml up -d --build`. Embeddings
+   come from the Arc A380 through the host-side TEI `/embed` shim on
+   `host.docker.internal:7311`; there is no local embedding sidecar. Check
    `curl -s http://127.0.0.1:8120/healthz` on Hestia and the public hostname.
 4. Confirm the log line `clustering uses the local embedding service` names
    `http:all-MiniLM-L6-v2`; if it says the built-in embedder, the URL did not

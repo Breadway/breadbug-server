@@ -21,9 +21,10 @@ The hashing embedder collapses on v2 because it only matches shared words:
 scores 0.00. It remains the zero-dependency fallback when no embedding
 service is configured.
 
-`all-MiniLM-L6-v2` is served by the `breadbug-embed` sidecar in
-`packaging/docker-compose.yml` (`text-embeddings-inference`, CPU). The
-threshold is model-specific and set with `BREADBUG_FUZZY_THRESHOLD`.
+`all-MiniLM-L6-v2` is served on the Hestia Arc A380 and exposed to the
+container through the host-side TEI `/embed` shim (`host.docker.internal:7311`,
+proxying to the llama.cpp server on 7310). The threshold is model-specific and
+set with `BREADBUG_FUZZY_THRESHOLD`.
 
 ## Threshold choice for MiniLM
 
@@ -75,9 +76,9 @@ BREADBUG_EVAL_THRESHOLD=0.50 \
 
 The test fails below 0.90 precision or 0.55 recall on either set.
 
-For a production-like check, point `BREADBUG_EVAL_EMBED_URL` at the sidecar
-(`http://breadbug-embed:8080/embed`) from a container on the `packaging_breadbug`
-network.
+For a production-like check, point `BREADBUG_EVAL_EMBED_URL` at the Hestia Arc
+shim (`http://host.docker.internal:7311/embed`) from a container with
+`host.docker.internal:host-gateway` mapped.
 
 ## Matching rules
 
