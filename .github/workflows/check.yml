@@ -1,0 +1,35 @@
+name: check
+
+# GitHub-hosted dual-run pilot for INFRA-327. This mirrors the Forgejo
+# .forgejo/workflows/check.yml job on ubuntu-latest so both runners execute the
+# same commit while the Forgejo job remains the fallback.
+on:
+  push:
+    branches: ['feature/**', 'fix/**', 'main']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: backup privacy tests
+        run: python3 -m unittest discover -s packaging -p 'test_*.py'
