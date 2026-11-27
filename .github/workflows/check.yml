@@ -23,6 +23,8 @@ jobs:
         # Pin to the toolchain the Forgejo runner uses so the dual-run compares
         # the same clippy rules, not a newer stable release.
         uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
 
       - name: rust cache
         uses: Swatinem/rust-cache@v2
